@@ -223,15 +223,18 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    const delay = this.calculateTokenRefreshDelayMs(sasToken);
+    const MAX_TIMEOUT_MS = 2_147_483_647; // ~24.8 days
 
-    this.log.debug(`[PLATFORM] Scheduling SAS token refresh in ${(delay / 1000).toFixed(0)} seconds`);
+    const delay = this.calculateTokenRefreshDelayMs(sasToken);
+    const safeDelay = Math.min(delay, MAX_TIMEOUT_MS);
+
+    this.log.debug(`[PLATFORM] Scheduling SAS token refresh in ${(safeDelay / 1000).toFixed(0)} seconds`);
 
     this.tokenRefreshTimer = setTimeout(() => {
       this.refreshSasToken().catch(error => {
         this.log.error(`[PLATFORM] Unexpected error while refreshing token: ${this.errorToString(error)}`);
       });
-    }, delay);
+    }, safeDelay);
   }
 
   private scheduleTokenRefreshRetry(): void {
