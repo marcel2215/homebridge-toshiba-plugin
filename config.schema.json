@@ -1,17 +1,82 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "ToshibaSmartAC",
   "pluginType": "platform",
   "singular": true,
-  "strictValidation": false,
+  "strictValidation": true,
   "schema": {
     "type": "object",
-    "required": ["name"],
+    "required": [
+      "name",
+      "username",
+      "password"
+    ],
     "additionalProperties": false,
     "properties": {
       "name": {
         "title": "Name",
         "type": "string",
-        "default": "Example Dynamic Platform"
+        "default": "Toshiba Smart AC"
+      },
+      "username": {
+        "title": "Username / Email",
+        "type": "string",
+        "description": "Same username/email used in the Toshiba Home AC Control app."
+      },
+      "password": {
+        "title": "Password",
+        "type": "string",
+        "format": "password",
+        "description": "Same password used in the Toshiba Home AC Control app."
+      },
+      "pollIntervalSeconds": {
+        "title": "State Poll Interval (seconds)",
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 3600,
+        "default": 120,
+        "description": "Fallback cloud polling interval. Real-time AMQP push updates are still used."
+      },
+      "discoveryRefreshMinutes": {
+        "title": "Discovery Refresh (minutes)",
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 1440,
+        "default": 30,
+        "description": "How often to re-scan Toshiba cloud account for added/removed devices."
+      },
+      "requestTimeoutSeconds": {
+        "title": "HTTP Timeout (seconds)",
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 120,
+        "default": 60,
+        "description": "Timeout for Toshiba cloud API requests (official app behavior is 60s)."
+      },
+      "httpRetries": {
+        "title": "HTTP Retries",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10,
+        "default": 5,
+        "description": "Number of retries for transient cloud API failures (official app behavior is 5 retries)."
+      },
+      "enableFanService": {
+        "title": "Expose Fan Service",
+        "type": "boolean",
+        "default": true,
+        "description": "Adds an extra Fan service for fan-only mode in Home app."
+      },
+      "enableFeatureSwitches": {
+        "title": "Expose Feature Switches",
+        "type": "boolean",
+        "default": true,
+        "description": "Adds switch services for supported Toshiba features (Eco, Hi Power, etc.)."
+      },
+      "enableTemperatureSensors": {
+        "title": "Expose Temperature Sensors",
+        "type": "boolean",
+        "default": true,
+        "description": "Adds indoor/outdoor temperature sensor services."
       }
     }
   }

@@ -1,22 +1,25 @@
 {
-  "name": "homebridge-plugin-name",
-  "displayName": "Plugin Name",
+  "name": "homebridge-toshiba-plugin",
+  "displayName": "Toshiba Smart AC",
   "type": "module",
-  "version": "1.0.0",
-  "private": true,
-  "description": "A short description about what your plugin does.",
-  "author": "Your Name",
+  "version": "0.1.0",
+  "description": "Homebridge platform plugin for Toshiba Home AC Control cloud devices.",
+  "author": "Marcel",
   "license": "Apache-2.0",
-  "homepage": "https://github.com/USERNAME/GITHUB_PROJECT_NAME#readme",
+  "homepage": "https://github.com/marcel/homebridge-toshiba-plugin#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/USERNAME/GITHUB_PROJECT_NAME.git"
+    "url": "https://github.com/marcel/homebridge-toshiba-plugin.git"
   },
   "bugs": {
-    "url": "https://github.com/USERNAME/GITHUB_PROJECT_NAME/issues"
+    "url": "https://github.com/marcel/homebridge-toshiba-plugin/issues"
   },
   "keywords": [
-    "homebridge-plugin"
+    "homebridge-plugin",
+    "toshiba",
+    "air-conditioner",
+    "hvac",
+    "homekit"
   ],
   "main": "dist/index.js",
   "engines": {
@@ -30,7 +33,8 @@
     "watch": "npm run build && npm link && nodemon"
   },
   "dependencies": {
-    "homebridge-lib": "^7.1.12"
+    "azure-iot-device": "^1.18.3",
+    "azure-iot-device-amqp": "^1.14.3"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

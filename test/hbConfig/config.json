@@ -1,13 +1,13 @@
 {
   "bridge": {
-    "name": "PluginTemplate",
+    "name": "ToshibaDev",
     "username": "AA:BB:CC:DD:EE:FF",
     "port": 51826,
     "pin": "031-45-154"
   },
-  "description": "HomeBridge HTTP Status Control",
+  "description": "Homebridge Toshiba Smart AC development config",
   "plugins": [
-    "homebridge-plugin-name",
+    "homebridge-toshiba-plugin",
     "homebridge-config-ui-x"
   ],
   "platforms": [
@@ -23,8 +23,10 @@
       "debug": false
     },
     {
-      "name": "homebridge-plugin-name",
-      "platform": "ExampleHomebridgePlugin"
+      "name": "Toshiba Smart AC",
+      "platform": "ToshibaSmartAC",
+      "username": "your-email@example.com",
+      "password": "your-password"
     }
   ],
   "accessories": []
