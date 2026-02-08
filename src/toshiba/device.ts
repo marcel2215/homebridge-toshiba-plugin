@@ -1,5 +1,6 @@
 import type { Logging } from 'homebridge';
 
+import { COMMAND_COALESCE_DELAY_MS } from './constants.js';
 import { ToshibaAcFeatures } from './features.js';
 import { ToshibaFcuState } from './state.js';
 import type { ToshibaAdditionalInfo, ToshibaDiscoveredDevice } from './types.js';
@@ -26,11 +27,20 @@ export class ToshibaAcDevice {
   readonly groupName: string;
   readonly acModelId: string;
   readonly meritFeature: string;
+  readonly opeMode?: string;
+  readonly systemConfig?: string;
   readonly adapterType?: string;
   readonly firmwareVersion?: string;
 
   private readonly listeners = new Set<ToshibaDeviceChangeListener>();
   private commandQueue: Promise<void> = Promise.resolve();
+  private pendingPatch?: ToshibaFcuState;
+  private pendingDescriptions = new Set<string>();
+  private pendingWaiters: Array<{
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  private commandFlushTimer?: NodeJS.Timeout;
 
   private readonly state: ToshibaFcuState;
   readonly supported: ToshibaAcFeatures;
@@ -45,6 +55,7 @@ export class ToshibaAcDevice {
     private readonly amqp: ToshibaAmqpClient,
     discovered: ToshibaDiscoveredDevice,
     additionalInfo?: ToshibaAdditionalInfo,
+    private readonly ensureDeviceOnline?: (uniqueId: string, name: string) => Promise<void>,
   ) {
     this.id = discovered.acId;
     this.uniqueId = discovered.uniqueId;
@@ -53,11 +64,13 @@ export class ToshibaAcDevice {
     this.groupName = discovered.groupName;
     this.acModelId = discovered.acModelId;
     this.meritFeature = discovered.meritFeature;
+    this.opeMode = discovered.opeMode;
+    this.systemConfig = discovered.systemConfig;
     this.adapterType = discovered.adapterType;
     this.firmwareVersion = discovered.firmwareVersion;
 
     this.state = ToshibaFcuState.fromHexState(discovered.stateHex);
-    this.supported = ToshibaAcFeatures.fromMeritStringAndModel(this.meritFeature, this.acModelId);
+    this.supported = ToshibaAcFeatures.fromMeritStringAndModel(this.meritFeature, this.acModelId, this.opeMode);
 
     this.updateAdditionalInfo(additionalInfo);
 
@@ -241,15 +254,65 @@ export class ToshibaAcDevice {
   }
 
   private queueStatePatch(description: string, mutatePatch: (patch: ToshibaFcuState) => void): Promise<void> {
+    const patch = new ToshibaFcuState();
+    mutatePatch(patch);
+
+    if (!this.pendingPatch) {
+      this.pendingPatch = patch;
+    } else {
+      this.pendingPatch.mergeFrom(patch);
+    }
+
+    this.pendingDescriptions.add(description);
+
+    if (this.commandFlushTimer) {
+      clearTimeout(this.commandFlushTimer);
+      this.commandFlushTimer = undefined;
+    }
+
+    this.commandFlushTimer = setTimeout(() => {
+      this.commandFlushTimer = undefined;
+      this.flushPendingPatch().catch(error => {
+        this.log.error(`[DEVICE] ${this.name}: failed to flush queued command: ${this.errorToString(error)}`);
+      });
+    }, COMMAND_COALESCE_DELAY_MS);
+
+    return new Promise((resolve, reject) => {
+      this.pendingWaiters.push({ resolve, reject });
+    });
+  }
+
+  private async flushPendingPatch(): Promise<void> {
+    const patch = this.pendingPatch;
+    if (!patch) {
+      return;
+    }
+
+    const waiters = this.pendingWaiters;
+    const descriptions = [...this.pendingDescriptions];
+
+    this.pendingPatch = undefined;
+    this.pendingWaiters = [];
+    this.pendingDescriptions.clear();
+
+    const description = descriptions.length > 1
+      ? `coalesced updates (${descriptions.length} changes)`
+      : descriptions[0] ?? 'command';
+
     const execute = async (): Promise<void> => {
-      const patch = new ToshibaFcuState();
-      mutatePatch(patch);
       await this.sendStatePatch(description, patch);
     };
 
     const pending = this.commandQueue.then(execute, execute);
     this.commandQueue = pending.catch(() => undefined);
-    return pending;
+
+    try {
+      await pending;
+      waiters.forEach(waiter => waiter.resolve());
+    } catch (error) {
+      waiters.forEach(waiter => waiter.reject(error));
+      throw error;
+    }
   }
 
   private async sendStatePatch(description: string, patch: ToshibaFcuState): Promise<void> {
@@ -317,6 +380,9 @@ export class ToshibaAcDevice {
 
     const encodedPatch = patch.encode();
     this.log.debug(`[DEVICE] ${this.name}: ${description} -> ${encodedPatch}`);
+    if (this.ensureDeviceOnline) {
+      await this.ensureDeviceOnline(this.uniqueId, this.name);
+    }
     await this.amqp.sendState(this.uniqueId, encodedPatch);
 
     if (this.state.mergeFrom(patch)) {

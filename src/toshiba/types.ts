@@ -104,6 +104,8 @@ export interface ToshibaMappedAc {
   Name: string;
   ACModelId: string;
   MeritFeature: string;
+  OpeMode?: string;
+  SystemConfig?: string;
   ACStateData: string;
   AdapterType?: string;
   FirmwareVersion?: string;
@@ -117,6 +119,8 @@ export interface ToshibaDiscoveredDevice {
   groupName: string;
   acModelId: string;
   meritFeature: string;
+  opeMode?: string;
+  systemConfig?: string;
   stateHex: string;
   adapterType?: string;
   firmwareVersion?: string;

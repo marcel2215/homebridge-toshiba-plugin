@@ -26,6 +26,8 @@ export const DEFAULT_ENABLE_FEATURE_SWITCHES = true;
 export const DEFAULT_ENABLE_TEMPERATURE_SENSORS = true;
 
 export const TOKEN_REFRESH_ADVANCE_SECONDS = 10 * 60;
+export const TOKEN_REFRESH_RETRY_DELAY_MS = 5 * 60 * 1000;
+export const COMMAND_COALESCE_DELAY_MS = 500;
 
 export const TOSHIBA_HTTP_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +

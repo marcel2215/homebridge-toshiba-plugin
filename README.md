@@ -15,6 +15,8 @@ Homebridge dynamic platform plugin for Toshiba **Home AC Control** cloud devices
 - Mobile cloud registration supports both response formats used by the app backend (`SasToken` or `HostName` + `DeviceId` + `PrimaryKey`).
 - Device auto-discovery and cache reconciliation.
 - Automatic AMQP reconnect with exponential backoff after cloud disconnects.
+- Command coalescing (500ms debounce) to mirror native app command burst behavior.
+- Command preflight online check (`GetAllDeviceState`) before AMQP sends, with offline protection.
 - Command-send retries with detailed logs for transient AMQP send failures.
 - HeaterCooler control:
   - Power (`Active`)
@@ -84,5 +86,8 @@ npm run build
 
 - Verify your Toshiba app credentials.
 - Check Homebridge logs for `HTTP API` / `AMQP API` messages.
+- If a child bridge appears to stop with empty plugin logs, make sure you are running the latest plugin build:
+  - `npm run build`
+  - restart Homebridge after updating.
 - If login works but no accessories appear, confirm devices are visible in the official Toshiba app account.
 - If accessories become stale, restart Homebridge and verify cloud connectivity.

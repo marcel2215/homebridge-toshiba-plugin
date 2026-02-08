@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { Logging } from 'homebridge';
 
 import type { DeviceMethodRequest, DeviceMethodResponse } from 'azure-iot-device';
-import { Client, Message } from 'azure-iot-device';
+import azureIotDevice from 'azure-iot-device';
 import { Amqp } from 'azure-iot-device-amqp';
 
 import { AMQP_METHOD_NAME, CMD_FCU_TO_AC } from './constants.js';
@@ -13,7 +13,7 @@ import type { ToshibaAmqpMethodPayload } from './types.js';
 export type ToshibaAmqpCommandHandler = (payload: ToshibaAmqpMethodPayload) => Promise<void> | void;
 
 export class ToshibaAmqpClient {
-  private client?: Client;
+  private client?: azureIotDevice.Client;
   private readonly handlers = new Map<string, ToshibaAmqpCommandHandler>();
   private connectionLossHandler?: (error?: Error) => Promise<void> | void;
   private isIntentionalDisconnect = false;
@@ -95,7 +95,7 @@ export class ToshibaAmqpClient {
       payload: {
         data: stateHex,
       },
-      timeStamp: '0000000',
+      timeStamp: this.generateEventTimestamp(),
     };
 
     const maxAttempts = 3;
@@ -108,7 +108,7 @@ export class ToshibaAmqpClient {
           throw new Error('AMQP client is not connected');
         }
 
-        const message = new Message(JSON.stringify(messagePayload));
+        const message = new azureIotDevice.Message(JSON.stringify(messagePayload));
         message.properties.add('type', 'mob');
         message.contentType = 'application/json';
         message.contentEncoding = 'utf-8';
@@ -141,9 +141,9 @@ export class ToshibaAmqpClient {
     throw lastError;
   }
 
-  private createClient(registration: ToshibaMobileRegistration): Client {
+  private createClient(registration: ToshibaMobileRegistration): azureIotDevice.Client {
     if (typeof registration.SasToken === 'string' && registration.SasToken.length > 0) {
-      return Client.fromSharedAccessSignature(registration.SasToken, Amqp);
+      return azureIotDevice.Client.fromSharedAccessSignature(registration.SasToken, Amqp);
     }
 
     if (
@@ -155,7 +155,7 @@ export class ToshibaAmqpClient {
       registration.PrimaryKey.length > 0
     ) {
       const connectionString = `HostName=${registration.HostName};DeviceId=${registration.DeviceId};SharedAccessKey=${registration.PrimaryKey}`;
-      return Client.fromConnectionString(connectionString, Amqp);
+      return azureIotDevice.Client.fromConnectionString(connectionString, Amqp);
     }
 
     throw new Error('Missing AMQP registration data from Toshiba API');
@@ -219,5 +219,14 @@ export class ToshibaAmqpClient {
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private generateEventTimestamp(): string {
+    const now = new Date();
+    const hours = now.getUTCHours().toString().padStart(2, '0');
+    const minutes = now.getUTCMinutes().toString().padStart(2, '0');
+    const seconds = now.getUTCSeconds().toString().padStart(2, '0');
+    const fractional = (now.getUTCMilliseconds() * 10_000).toString().padStart(7, '0');
+    return `${hours}:${minutes}:${seconds}.${fractional}`;
   }
 }

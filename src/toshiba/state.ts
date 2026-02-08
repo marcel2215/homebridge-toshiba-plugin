@@ -274,7 +274,8 @@ export class ToshibaFcuState {
 
   private normalizeCompressedState(hexState: string): string {
     const clean = hexState.trim().toLowerCase().replace(/[^0-9a-f]/g, '');
-    const compact = clean.slice(0, 38).padEnd(38, 'f');
+    const padded = clean.padEnd(38, 'f');
+    const compact = padded.length % 2 === 0 ? padded : `${padded}f`;
 
     if (compact.length < 14) {
       throw new Error(`Malformed Toshiba FCU state payload: ${hexState}`);

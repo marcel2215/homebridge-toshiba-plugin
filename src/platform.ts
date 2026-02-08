@@ -25,11 +25,12 @@ import {
   DEFAULT_HTTP_RETRIES,
   DEFAULT_HTTP_TIMEOUT_MS,
   DEFAULT_STATE_POLL_INTERVAL_SECONDS,
+  TOKEN_REFRESH_RETRY_DELAY_MS,
   TOKEN_REFRESH_ADVANCE_SECONDS,
 } from './toshiba/constants.js';
 import { ToshibaAcDevice } from './toshiba/device.js';
 import { ToshibaApiError, ToshibaAuthError, ToshibaHttpApi } from './toshiba/httpApi.js';
-import type { ToshibaDiscoveredDevice, ToshibaPlatformDeviceOptions } from './toshiba/types.js';
+import type { ToshibaDeviceConnectionState, ToshibaDiscoveredDevice, ToshibaPlatformDeviceOptions } from './toshiba/types.js';
 
 interface ToshibaPlatformConfig extends PlatformConfig {
   username?: string;
@@ -169,6 +170,8 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         this.log.info('[PLATFORM] Refreshed Toshiba cloud registration');
       } catch (error) {
         this.log.error(`[PLATFORM] Failed to refresh cloud registration: ${this.errorToString(error)}`);
+        this.log.warn(`[PLATFORM] Retrying cloud registration refresh in ${Math.round(TOKEN_REFRESH_RETRY_DELAY_MS / 1000)} seconds`);
+        this.scheduleTokenRefreshRetry();
       }
     });
   }
@@ -231,6 +234,19 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     }, delay);
   }
 
+  private scheduleTokenRefreshRetry(): void {
+    if (this.tokenRefreshTimer) {
+      clearTimeout(this.tokenRefreshTimer);
+      this.tokenRefreshTimer = undefined;
+    }
+
+    this.tokenRefreshTimer = setTimeout(() => {
+      this.refreshSasToken().catch(error => {
+        this.log.error(`[PLATFORM] Unexpected error while refreshing token: ${this.errorToString(error)}`);
+      });
+    }, TOKEN_REFRESH_RETRY_DELAY_MS);
+  }
+
   private calculateTokenRefreshDelayMs(sasToken: string): number {
     const tokenParts = sasToken.split('&');
     const expirationPart = tokenParts.find(part => part.startsWith('se='));
@@ -286,7 +302,13 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
       let device = this.devicesByUniqueId.get(discovered.uniqueId);
       if (!device) {
-        device = new ToshibaAcDevice(this.log, this.amqpClient, discovered, additionalInfo);
+        device = new ToshibaAcDevice(
+          this.log,
+          this.amqpClient,
+          discovered,
+          additionalInfo,
+          async (uniqueId, name) => this.ensureDeviceOnline(uniqueId, name),
+        );
         this.devicesByUniqueId.set(discovered.uniqueId, device);
       } else {
         device.updateIdentity(discovered.name);
@@ -464,6 +486,32 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     const queued = this.operationQueue.then(operation, operation);
     this.operationQueue = queued.catch(() => undefined);
     return queued;
+  }
+
+  private async ensureDeviceOnline(uniqueId: string, deviceName: string): Promise<void> {
+    if (!this.httpApi) {
+      return;
+    }
+
+    let states: ToshibaDeviceConnectionState[];
+    try {
+      states = await this.httpApi.getDeviceConnectionStates([uniqueId]);
+    } catch (error) {
+      if (!(error instanceof ToshibaAuthError)) {
+        throw error;
+      }
+
+      this.log.warn(`[PLATFORM] Auth expired before command precheck for ${deviceName}; reconnecting cloud session`);
+      await this.connectCloud();
+      states = await this.httpApi.getDeviceConnectionStates([uniqueId]);
+    }
+    const state = states.find(item => item.DeviceId === uniqueId);
+
+    if (!state || state.ConnectionState === 'Connected') {
+      return;
+    }
+
+    throw new Error(`[${deviceName}] Toshiba cloud reports device offline (${state.ConnectionState})`);
   }
 
   private async shutdown(): Promise<void> {

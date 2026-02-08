@@ -98,7 +98,9 @@ export class ToshibaHttpApi {
 
   async getDevices(): Promise<ToshibaDiscoveredDevice[]> {
     const groups = await this.withRetry('get devices', async () => {
-      return this.request<ToshibaAcMappingGroup[]>(API_AC_MAPPING_PATH);
+      return this.request<ToshibaAcMappingGroup[]>(API_AC_MAPPING_PATH, {
+        includeConsumerId: true,
+      });
     });
 
     return groups.flatMap(group => {
@@ -114,6 +116,8 @@ export class ToshibaHttpApi {
         groupName: group.GroupName,
         acModelId: ac.ACModelId,
         meritFeature: ac.MeritFeature,
+        opeMode: ac.OpeMode,
+        systemConfig: ac.SystemConfig,
         stateHex: ac.ACStateData,
         adapterType: ac.AdapterType,
         firmwareVersion: ac.FirmwareVersion,
@@ -151,9 +155,20 @@ export class ToshibaHttpApi {
   }
 
   async getDeviceAdditionalInfo(acId: string, uniqueId?: string): Promise<ToshibaAdditionalInfo> {
-    const state = uniqueId
-      ? await this.fetchDeviceStateByUniqueId(uniqueId)
-      : await this.fetchDeviceStateByAcId(acId);
+    let state: ToshibaDeviceStateResponse;
+    if (uniqueId) {
+      try {
+        state = await this.fetchDeviceStateByUniqueId(uniqueId);
+      } catch (error) {
+        if (error instanceof ToshibaAuthError) {
+          throw error;
+        }
+        this.log.debug(`[HTTP API] Failed to fetch additional info by unique id (${uniqueId}), falling back to ACId (${acId})`);
+        state = await this.fetchDeviceStateByAcId(acId);
+      }
+    } else {
+      state = await this.fetchDeviceStateByAcId(acId);
+    }
 
     return {
       cduModelName: state.Cdu?.model_name,
@@ -166,6 +181,7 @@ export class ToshibaHttpApi {
   async registerMobileClient(deviceId: string): Promise<ToshibaMobileRegistration> {
     const response = await this.withRetry('register mobile device', async () => {
       return this.request<ToshibaMobileRegistration>(API_REGISTER_DEVICE_PATH, {
+        includeConsumerId: false,
         body: {
           DeviceID: `${this.normalizedUsername}_${deviceId}`,
           DeviceType: '1',
@@ -197,6 +213,7 @@ export class ToshibaHttpApi {
   private async fetchDeviceStateByAcId(acId: string): Promise<ToshibaDeviceStateResponse> {
     return this.withRetry(`get device state (${acId})`, async () => {
       return this.request<ToshibaDeviceStateResponse>(API_AC_STATE_PATH, {
+        includeConsumerId: false,
         query: {
           ACId: acId,
         },
@@ -207,6 +224,7 @@ export class ToshibaHttpApi {
   private async fetchDeviceStateByUniqueId(uniqueId: string): Promise<ToshibaDeviceStateResponse> {
     return this.withRetry(`get device state (${uniqueId})`, async () => {
       return this.request<ToshibaDeviceStateResponse>(API_AC_STATE_BY_UNIQUE_ID_PATH, {
+        includeConsumerId: false,
         query: {
           ACDeviceUniqueId: uniqueId,
         },
@@ -278,7 +296,7 @@ export class ToshibaHttpApi {
 
   private async request<T>(path: string, opts?: ToshibaRequestOptions): Promise<T> {
     const includeAuth = opts?.includeAuth ?? true;
-    const includeConsumerId = opts?.includeConsumerId ?? true;
+    const includeConsumerId = opts?.includeConsumerId ?? false;
     const query = new URLSearchParams();
 
     if (includeConsumerId && this.consumerId) {
