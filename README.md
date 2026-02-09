@@ -100,7 +100,10 @@ npm run build
 
 ```bash
 # Optional: bump version first
-npm version patch
+npm run version:bump:revision
+# or
+npm run version:bump:minor
+npm run version:bump:major
 
 # Preview publish
 npm run publish:plugin:dry-run
