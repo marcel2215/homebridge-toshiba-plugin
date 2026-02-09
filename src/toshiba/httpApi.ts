@@ -30,6 +30,7 @@ export class ToshibaApiError extends Error {
     message: string,
     public readonly statusCode?: string,
     public readonly httpStatus?: number,
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
   }
@@ -103,26 +104,66 @@ export class ToshibaHttpApi {
       });
     });
 
-    return groups.flatMap(group => {
-      if (!Array.isArray(group.ACList)) {
-        return [];
+    if (!Array.isArray(groups)) {
+      throw new ToshibaApiError('Malformed device mapping payload: expected array');
+    }
+
+    const devices: ToshibaDiscoveredDevice[] = [];
+    for (const [groupIndex, groupRaw] of groups.entries()) {
+      if (typeof groupRaw !== 'object' || groupRaw === null) {
+        this.log.warn(`[HTTP API] Skipping malformed device group at index ${groupIndex}`);
+        continue;
       }
 
-      return group.ACList.map(ac => ({
-        acId: ac.Id,
-        uniqueId: ac.DeviceUniqueId,
-        name: ac.Name,
-        groupId: group.GroupId,
-        groupName: group.GroupName,
-        acModelId: ac.ACModelId,
-        meritFeature: ac.MeritFeature,
-        opeMode: ac.OpeMode,
-        systemConfig: ac.SystemConfig,
-        stateHex: ac.ACStateData,
-        adapterType: ac.AdapterType,
-        firmwareVersion: ac.FirmwareVersion,
-      }));
-    });
+      const group = groupRaw as ToshibaAcMappingGroup;
+      const groupId = typeof group.GroupId === 'string' && group.GroupId.length > 0 ? group.GroupId : `group-${groupIndex + 1}`;
+      const groupName = typeof group.GroupName === 'string' && group.GroupName.length > 0 ? group.GroupName : groupId;
+      const acList = Array.isArray(group.ACList) ? group.ACList : [];
+
+      if (!Array.isArray(group.ACList)) {
+        this.log.warn(`[HTTP API] Group ${groupId} has malformed ACList; skipping`);
+        continue;
+      }
+
+      for (const [acIndex, acRaw] of acList.entries()) {
+        if (typeof acRaw !== 'object' || acRaw === null) {
+          this.log.warn(`[HTTP API] Skipping malformed AC entry in group ${groupId} at index ${acIndex}`);
+          continue;
+        }
+
+        const ac = acRaw as ToshibaAcMappingGroup['ACList'][number];
+        const hasRequiredFields = (
+          typeof ac.Id === 'string' && ac.Id.length > 0 &&
+          typeof ac.DeviceUniqueId === 'string' && ac.DeviceUniqueId.length > 0 &&
+          typeof ac.Name === 'string' && ac.Name.length > 0 &&
+          typeof ac.ACModelId === 'string' && ac.ACModelId.length > 0 &&
+          typeof ac.MeritFeature === 'string' && ac.MeritFeature.length > 0 &&
+          typeof ac.ACStateData === 'string' && ac.ACStateData.length > 0
+        );
+
+        if (!hasRequiredFields) {
+          this.log.warn(`[HTTP API] Skipping AC entry with missing required fields in group ${groupId} at index ${acIndex}`);
+          continue;
+        }
+
+        devices.push({
+          acId: ac.Id,
+          uniqueId: ac.DeviceUniqueId,
+          name: ac.Name,
+          groupId,
+          groupName,
+          acModelId: ac.ACModelId,
+          meritFeature: ac.MeritFeature,
+          opeMode: ac.OpeMode,
+          systemConfig: ac.SystemConfig,
+          stateHex: ac.ACStateData,
+          adapterType: ac.AdapterType,
+          firmwareVersion: ac.FirmwareVersion,
+        });
+      }
+    }
+
+    return devices;
   }
 
   async getDeviceState(acId: string): Promise<string> {
@@ -254,9 +295,9 @@ export class ToshibaHttpApi {
           break;
         }
 
-        const backoff = this.randomBackoff(attempt);
-        this.log.warn(`[HTTP API] ${action} failed (attempt ${attempt}/${maxAttempts}): ${this.errorToString(error)}. Retrying in ${backoff}ms`);
-        await this.sleep(backoff);
+        const delay = this.computeRetryDelayMs(error, attempt);
+        this.log.warn(`[HTTP API] ${action} failed (attempt ${attempt}/${maxAttempts}): ${this.errorToString(error)}. Retrying in ${delay}ms`);
+        await this.sleep(delay);
       }
     }
 
@@ -270,22 +311,35 @@ export class ToshibaHttpApi {
 
     if (error instanceof ToshibaApiError) {
       if (typeof error.httpStatus === 'number') {
-        if (error.httpStatus === 401 || error.httpStatus === 429) {
+        if (error.httpStatus === 401) {
           return false;
         }
 
-        return true;
+        if (error.httpStatus === 408 || error.httpStatus === 429) {
+          return true;
+        }
+
+        return error.httpStatus >= 500;
       }
 
       const statusCodeText = (error.statusCode ?? '').toLowerCase();
       if (statusCodeText.includes('toomanyrequest') || statusCodeText.includes('429')) {
-        return false;
+        return true;
       }
 
       return true;
     }
 
     return true;
+  }
+
+  private computeRetryDelayMs(error: unknown, attempt: number): number {
+    const exponentialBackoff = this.randomBackoff(attempt);
+    if (error instanceof ToshibaApiError && typeof error.retryAfterMs === 'number' && Number.isFinite(error.retryAfterMs)) {
+      return Math.max(exponentialBackoff, Math.max(0, error.retryAfterMs));
+    }
+
+    return exponentialBackoff;
   }
 
   private randomBackoff(attempt: number): number {
@@ -339,23 +393,47 @@ export class ToshibaHttpApi {
       });
 
       if (!response.ok) {
+        const retryAfterMs = response.status === 429 ? this.parseRetryAfterMs(response.headers.get('Retry-After')) : undefined;
+
         if (response.status === 401) {
           throw new ToshibaAuthError(`HTTP ${response.status} while calling ${path}`, 'Unauthorized', response.status);
         }
 
-        throw new ToshibaApiError(`HTTP ${response.status} while calling ${path}`, undefined, response.status);
-      }
-
-      const payload = await response.json() as ToshibaApiEnvelope<T>;
-      if (!payload.IsSuccess) {
-        if (this.isAuthFailure(payload.StatusCode, payload.Message)) {
-          throw new ToshibaAuthError(payload.Message || 'Toshiba API authentication failed', payload.StatusCode, response.status);
+        if (response.status === 429) {
+          throw new ToshibaApiError(`HTTP ${response.status} while calling ${path}`, 'TooManyRequests', response.status, retryAfterMs);
         }
 
-        throw new ToshibaApiError(payload.Message || 'Toshiba API returned failure', payload.StatusCode, response.status);
+        throw new ToshibaApiError(`HTTP ${response.status} while calling ${path}`, undefined, response.status, retryAfterMs);
       }
 
-      return payload.ResObj;
+      let payloadRaw: unknown;
+      try {
+        payloadRaw = await response.json();
+      } catch (error) {
+        throw new ToshibaApiError(`Failed to parse Toshiba API response for ${path}: ${this.errorToString(error)}`, undefined, response.status);
+      }
+
+      if (typeof payloadRaw !== 'object' || payloadRaw === null) {
+        throw new ToshibaApiError(`Malformed Toshiba API payload for ${path}: expected JSON object`, undefined, response.status);
+      }
+
+      const payload = payloadRaw as Partial<ToshibaApiEnvelope<T>>;
+      const statusCode = typeof payload.StatusCode === 'string' ? payload.StatusCode : undefined;
+      const message = typeof payload.Message === 'string' ? payload.Message : undefined;
+
+      if (payload.IsSuccess !== true) {
+        if (this.isAuthFailure(statusCode, message)) {
+          throw new ToshibaAuthError(message || 'Toshiba API authentication failed', statusCode, response.status);
+        }
+
+        throw new ToshibaApiError(message || 'Toshiba API returned failure', statusCode, response.status);
+      }
+
+      if (!('ResObj' in payload)) {
+        throw new ToshibaApiError(`Malformed Toshiba API payload for ${path}: missing ResObj`, undefined, response.status);
+      }
+
+      return payload.ResObj as T;
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw new ToshibaApiError(`Request timeout after ${this.timeoutMs}ms while calling ${path}`);
@@ -369,6 +447,25 @@ export class ToshibaHttpApi {
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private parseRetryAfterMs(value: string | null): number | undefined {
+    if (!value) {
+      return undefined;
+    }
+
+    const trimmed = value.trim();
+    const seconds = Number.parseInt(trimmed, 10);
+    if (Number.isFinite(seconds)) {
+      return Math.max(0, seconds * 1_000);
+    }
+
+    const retryDateMs = Date.parse(trimmed);
+    if (Number.isFinite(retryDateMs)) {
+      return Math.max(0, retryDateMs - Date.now());
+    }
+
+    return undefined;
   }
 
   private isAuthFailure(statusCode?: string, message?: string): boolean {

@@ -322,6 +322,9 @@ export class ToshibaPlatformAccessory {
     const candidates = FAN_SPEED_MAP.filter(([fanMode]) => (
       fanMode !== ToshibaAcFanMode.AUTO && fanMode !== ToshibaAcFanMode.QUIET
     ));
+    if (candidates.length === 0) {
+      return ToshibaAcFanMode.AUTO;
+    }
 
     const selected = candidates.reduce((best, candidate) => {
       const bestDistance = Math.abs(best[1] - speed);

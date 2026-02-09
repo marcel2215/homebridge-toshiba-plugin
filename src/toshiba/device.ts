@@ -41,6 +41,7 @@ export class ToshibaAcDevice {
     reject: (error: unknown) => void;
   }> = [];
   private commandFlushTimer?: NodeJS.Timeout;
+  private isDisposed = false;
 
   private readonly state: ToshibaFcuState;
   readonly supported: ToshibaAcFeatures;
@@ -175,6 +176,29 @@ export class ToshibaAcDevice {
     this.listeners.delete(listener);
   }
 
+  dispose(): void {
+    if (this.isDisposed) {
+      return;
+    }
+
+    this.isDisposed = true;
+    this.listeners.clear();
+
+    if (this.commandFlushTimer) {
+      clearTimeout(this.commandFlushTimer);
+      this.commandFlushTimer = undefined;
+    }
+
+    const error = new Error(`[${this.name}] Device instance disposed`);
+    for (const waiter of this.pendingWaiters) {
+      waiter.reject(error);
+    }
+
+    this.pendingWaiters = [];
+    this.pendingPatch = undefined;
+    this.pendingDescriptions.clear();
+  }
+
   applyCloudState(hexState: string): boolean {
     const changed = this.state.update(hexState);
     if (changed) {
@@ -264,6 +288,10 @@ export class ToshibaAcDevice {
   }
 
   private queueStatePatch(description: string, mutatePatch: (patch: ToshibaFcuState) => void): Promise<void> {
+    if (this.isDisposed) {
+      return Promise.reject(new Error(`[${this.name}] Cannot queue command after device disposal`));
+    }
+
     const patch = new ToshibaFcuState();
     mutatePatch(patch);
 
@@ -286,6 +314,7 @@ export class ToshibaAcDevice {
         this.log.error(`[DEVICE] ${this.name}: failed to flush queued command: ${this.errorToString(error)}`);
       });
     }, COMMAND_COALESCE_DELAY_MS);
+    this.commandFlushTimer.unref?.();
 
     return new Promise((resolve, reject) => {
       this.pendingWaiters.push({ resolve, reject });
@@ -293,6 +322,10 @@ export class ToshibaAcDevice {
   }
 
   private async flushPendingPatch(): Promise<void> {
+    if (this.isDisposed) {
+      return;
+    }
+
     const patch = this.pendingPatch;
     if (!patch) {
       return;
@@ -326,6 +359,11 @@ export class ToshibaAcDevice {
   }
 
   private async sendStatePatch(description: string, patch: ToshibaFcuState): Promise<void> {
+    if (this.isDisposed) {
+      throw new Error(`[${this.name}] Cannot send command after device disposal`);
+    }
+
+    const currentEncodedState = this.state.encode();
     const futureState = this.state.clone();
     futureState.mergeFrom(patch);
 
@@ -388,11 +426,23 @@ export class ToshibaAcDevice {
       patch.acTemperature = requestedTemperature + 16;
     }
 
+    const adjustedFutureState = this.state.clone();
+    adjustedFutureState.mergeFrom(patch);
+    if (adjustedFutureState.encode() === currentEncodedState) {
+      this.log.debug(`[DEVICE] ${this.name}: skipped ${description}; no effective state change`);
+      return;
+    }
+
     const encodedPatch = patch.encode();
     this.log.debug(`[DEVICE] ${this.name}: ${description} -> ${encodedPatch}`);
     if (this.ensureDeviceOnline) {
       await this.ensureDeviceOnline(this.uniqueId, this.name);
     }
+
+    if (this.isDisposed) {
+      throw new Error(`[${this.name}] Command aborted because device was disposed`);
+    }
+
     await this.amqp.sendState(this.uniqueId, encodedPatch);
 
     if (this.state.mergeFrom(patch)) {
@@ -405,6 +455,10 @@ export class ToshibaAcDevice {
   }
 
   private notifyChanged(): void {
+    if (this.isDisposed) {
+      return;
+    }
+
     for (const listener of this.listeners) {
       try {
         listener(this);

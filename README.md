@@ -13,11 +13,18 @@ Homebridge dynamic platform plugin for Toshiba **Home AC Control** cloud devices
 - Cloud authentication + automatic SAS token refresh.
 - Login payload includes Toshiba `BrandId` and mobile registration uses username-prefixed device id format (app parity).
 - Mobile cloud registration supports both response formats used by the app backend (`SasToken` or `HostName` + `DeviceId` + `PrimaryKey`).
+- Startup self-recovery for transient cloud/network errors with exponential retry backoff.
 - Device auto-discovery and cache reconciliation.
+- Resilient discovery parsing (malformed cloud entries are skipped instead of aborting discovery).
 - Automatic AMQP reconnect with exponential backoff after cloud disconnects.
+- AMQP operation timeout guards (connect/send/disconnect) with failure-triggered recovery.
+- Poll/discovery overlap protection to avoid queue buildup during slow cloud responses.
 - Command coalescing (500ms debounce) to mirror native app command burst behavior.
+- No-op command suppression (skips AMQP send when requested state already matches current effective state).
 - Command preflight online check (`GetAllDeviceState`) before AMQP sends, with offline protection.
+- Short-lived connection-state cache on command precheck to reduce command latency and cloud rate-limit pressure.
 - Command-send retries with detailed logs for transient AMQP send failures.
+- Defensive payload parsing and malformed-cloud-update guards.
 - Single accessory model: each Toshiba AC is exposed as one HomeKit `HeaterCooler` service (no extra Fan/Switch/Sensor services).
 - HeaterCooler control:
   - Power (`Active`)
