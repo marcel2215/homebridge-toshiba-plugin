@@ -69,6 +69,8 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   private startupRetryAttempt = 0;
   private stateRefreshInProgress = false;
   private discoveryRefreshInProgress = false;
+  private uniqueStateEndpointForbidden = false;
+  private additionalInfoEndpointForbidden = false;
 
   constructor(
     public readonly log: Logging,
@@ -337,19 +339,29 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       try {
         let additionalInfo;
 
-        try {
-          additionalInfo = await this.httpApi.getDeviceAdditionalInfo(discovered.acId, discovered.uniqueId);
-        } catch (error) {
-          if (error instanceof ToshibaAuthError) {
-            this.log.error(`[PLATFORM] Authentication failed while fetching details for ${discovered.name}; reconnecting cloud session`);
-            try {
-              await this.connectCloud();
-              additionalInfo = await this.httpApi.getDeviceAdditionalInfo(discovered.acId, discovered.uniqueId);
-            } catch (retryError) {
-              this.log.warn(`[PLATFORM] Failed to fetch additional info for ${discovered.name}: ${this.errorToString(retryError)}`);
+        if (!this.additionalInfoEndpointForbidden) {
+          try {
+            additionalInfo = await this.httpApi.getDeviceAdditionalInfo(discovered.acId, discovered.uniqueId);
+          } catch (error) {
+            if (error instanceof ToshibaAuthError) {
+              this.log.error(`[PLATFORM] Authentication failed while fetching details for ${discovered.name}; reconnecting cloud session`);
+              try {
+                await this.connectCloud();
+                additionalInfo = await this.httpApi.getDeviceAdditionalInfo(discovered.acId, discovered.uniqueId);
+              } catch (retryError) {
+                if (this.isHttpForbidden(retryError)) {
+                  this.additionalInfoEndpointForbidden = true;
+                  this.log.warn('[PLATFORM] Additional-info endpoint returned HTTP 403; disabling additional-info fetches for this session');
+                } else {
+                  this.log.warn(`[PLATFORM] Failed to fetch additional info for ${discovered.name}: ${this.errorToString(retryError)}`);
+                }
+              }
+            } else if (this.isHttpForbidden(error)) {
+              this.additionalInfoEndpointForbidden = true;
+              this.log.warn('[PLATFORM] Additional-info endpoint returned HTTP 403; disabling additional-info fetches for this session');
+            } else {
+              this.log.warn(`[PLATFORM] Failed to fetch additional info for ${discovered.name}: ${this.errorToString(error)}`);
             }
-          } else {
-            this.log.warn(`[PLATFORM] Failed to fetch additional info for ${discovered.name}: ${this.errorToString(error)}`);
           }
         }
 
@@ -504,19 +516,27 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       for (const device of this.devicesByUniqueId.values()) {
         try {
           let latestState: string;
-          try {
-            latestState = await this.httpApi!.getDeviceStateByUniqueId(device.uniqueId);
-          } catch (error) {
-            if (error instanceof ToshibaAuthError) {
-              throw error;
-            }
 
-            if (error instanceof ToshibaApiError) {
-              this.log.debug(
-                `[PLATFORM] Unique-id state fetch failed for ${device.name} (${device.uniqueId}), falling back to ACId: ${this.errorToString(error)}`,
-              );
-            }
+          if (!this.uniqueStateEndpointForbidden) {
+            try {
+              latestState = await this.httpApi!.getDeviceStateByUniqueId(device.uniqueId);
+            } catch (error) {
+              if (error instanceof ToshibaAuthError) {
+                throw error;
+              }
 
+              if (this.isHttpForbidden(error)) {
+                this.uniqueStateEndpointForbidden = true;
+                this.log.warn('[PLATFORM] Unique-device-id state endpoint returned HTTP 403; falling back to ACId state endpoint for this session');
+              } else if (error instanceof ToshibaApiError) {
+                this.log.debug(
+                  `[PLATFORM] Unique-id state fetch failed for ${device.name} (${device.uniqueId}), falling back to ACId: ${this.errorToString(error)}`,
+                );
+              }
+
+              latestState = await this.httpApi!.getDeviceState(device.id);
+            }
+          } else {
             latestState = await this.httpApi!.getDeviceState(device.id);
           }
 
@@ -593,13 +613,24 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     try {
       states = await this.httpApi.getDeviceConnectionStates([uniqueId]);
     } catch (error) {
-      if (!(error instanceof ToshibaAuthError)) {
-        throw error;
-      }
+      if (error instanceof ToshibaAuthError) {
+        this.log.warn(`[PLATFORM] Auth expired before command precheck for ${deviceName}; reconnecting cloud session`);
 
-      this.log.warn(`[PLATFORM] Auth expired before command precheck for ${deviceName}; reconnecting cloud session`);
-      await this.connectCloud();
-      states = await this.httpApi.getDeviceConnectionStates([uniqueId]);
+        try {
+          await this.connectCloud();
+          states = await this.httpApi.getDeviceConnectionStates([uniqueId]);
+        } catch (retryError) {
+          this.log.warn(
+            `[PLATFORM] Device online precheck failed for ${deviceName} after reconnect; allowing command: ${this.errorToString(retryError)}`,
+          );
+          return;
+        }
+      } else {
+        this.log.warn(
+          `[PLATFORM] Device online precheck failed for ${deviceName}; allowing command: ${this.errorToString(error)}`,
+        );
+        return;
+      }
     }
     const state = states.find(item => item.DeviceId === uniqueId);
 
@@ -707,6 +738,10 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     }
 
     return String(error);
+  }
+
+  private isHttpForbidden(error: unknown): boolean {
+    return error instanceof ToshibaApiError && error.httpStatus === 403;
   }
 
   private sleep(ms: number): Promise<void> {

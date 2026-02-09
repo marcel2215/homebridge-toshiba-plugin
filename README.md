@@ -23,6 +23,7 @@ Homebridge dynamic platform plugin for Toshiba **Home AC Control** cloud devices
 - No-op command suppression (skips AMQP send when requested state already matches current effective state).
 - Command preflight online check (`GetAllDeviceState`) before AMQP sends, with offline protection.
 - Short-lived connection-state cache on command precheck to reduce command latency and cloud rate-limit pressure.
+- If online precheck itself fails (timeout/network/transient cloud error), command falls back to best-effort send instead of hard-failing control.
 - Command-send retries with detailed logs for transient AMQP send failures.
 - Defensive payload parsing and malformed-cloud-update guards.
 - Single accessory model: each Toshiba AC is exposed as one HomeKit `HeaterCooler` service (no extra Fan/Switch/Sensor services).
@@ -49,6 +50,9 @@ The plugin keeps a single HomeKit `HeaterCooler` tile and maps Toshiba-specific 
   - `1..33%` => `POWER_50`
   - `34..66%` => `POWER_75`
   - `67..100%` => `POWER_100`
+- Rotation slider stability:
+  - Plugin keeps your last explicit slider value when cloud state still matches the same mapped Toshiba tuple.
+  - This prevents Home app “jumping” to quantized fan buckets after a successful set.
 
 Note: Toshiba `Merit A` is a single field in cloud payload, so overlapping low-speed modes use precedence:
 `HIGH_POWER` > `CDU_SILENT_1` > `ECO` > `OFF`.
