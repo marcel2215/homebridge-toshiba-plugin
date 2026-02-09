@@ -31,6 +31,8 @@
     "lint": "eslint . --max-warnings=0",
     "prepare": "npm run build",
     "prepublishOnly": "npm run lint && npm run build",
+    "publish:plugin": "bash ./scripts/publish.sh",
+    "publish:plugin:dry-run": "bash ./scripts/publish.sh --dry-run",
     "watch": "npm run build && npm link && nodemon"
   },
   "dependencies": {

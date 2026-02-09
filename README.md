@@ -96,6 +96,29 @@ npm run lint
 npm run build
 ```
 
+## Publish
+
+```bash
+# Optional: bump version first
+npm version patch
+
+# Preview publish
+npm run publish:plugin:dry-run
+
+# Publish to npm (latest tag)
+npm run publish:plugin
+```
+
+Optional flags:
+
+```bash
+# Use a custom dist-tag
+npm run publish:plugin -- --tag beta
+
+# If npm account uses 2FA
+npm run publish:plugin -- --otp 123456
+```
+
 ## Troubleshooting
 
 - Verify your Toshiba app credentials.
