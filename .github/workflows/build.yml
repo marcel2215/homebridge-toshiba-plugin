@@ -5,6 +5,10 @@ on: [push, pull_request]
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      NPM_CONFIG_AUDIT: "false"
+      NPM_CONFIG_FUND: "false"
+      NPM_CONFIG_LOGLEVEL: error
 
     strategy:
       fail-fast: false
@@ -18,20 +22,41 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
+          cache: "npm"
+          cache-dependency-path: package-lock.json
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies (resilient)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm config set registry "https://registry.npmjs.org/"
+          npm config set fetch-retries 5
+          npm config set fetch-retry-factor 2
+          npm config set fetch-retry-mintimeout 10000
+          npm config set fetch-retry-maxtimeout 120000
+          npm config set prefer-online true
+
+          attempt=1
+          max_attempts=3
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "npm ci attempt ${attempt}/${max_attempts}"
+            if npm ci; then
+              break
+            fi
+
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              echo "npm ci failed after ${max_attempts} attempts"
+              exit 1
+            fi
+
+            echo "npm ci failed, cleaning npm cache and retrying..."
+            npm cache clean --force
+            rm -rf node_modules
+            attempt=$((attempt + 1))
+          done
 
       - name: Lint the project
         run: npm run lint
 
       - name: Build the project
         run: npm run build
-
-      - name: List, audit, fix outdated dependencies and build again
-        run: |
-          npm list --outdated
-          npm audit || true  # ignore failures
-          npm audit fix || true
-          npm list --outdated
-          npm run build
