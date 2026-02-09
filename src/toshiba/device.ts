@@ -120,6 +120,10 @@ export class ToshibaAcDevice {
     return this.state.acFanMode;
   }
 
+  get powerSelection(): ToshibaAcPowerSelection {
+    return this.state.acPowerSelection;
+  }
+
   get swingMode(): ToshibaAcSwingMode {
     return this.state.acSwingMode;
   }
@@ -225,6 +229,12 @@ export class ToshibaAcDevice {
     return this.queueStatePatch('set fan mode', patch => {
       patch.acFanMode = mode;
       patch.acStatus = ToshibaAcStatus.ON;
+    });
+  }
+
+  async setPowerSelection(value: ToshibaAcPowerSelection): Promise<void> {
+    return this.queueStatePatch('set power selection', patch => {
+      patch.acPowerSelection = value;
     });
   }
 

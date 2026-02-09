@@ -18,6 +18,7 @@ Homebridge dynamic platform plugin for Toshiba **Home AC Control** cloud devices
 - Command coalescing (500ms debounce) to mirror native app command burst behavior.
 - Command preflight online check (`GetAllDeviceState`) before AMQP sends, with offline protection.
 - Command-send retries with detailed logs for transient AMQP send failures.
+- Single accessory model: each Toshiba AC is exposed as one HomeKit `HeaterCooler` service (no extra Fan/Switch/Sensor services).
 - HeaterCooler control:
   - Power (`Active`)
   - Mode (`Auto`, `Cool`, `Heat`)
@@ -25,17 +26,25 @@ Homebridge dynamic platform plugin for Toshiba **Home AC Control** cloud devices
   - Fan speed
   - Swing mode
   - Indoor temperature
-- Optional Fan service (fan-only mode).
-- Optional indoor/outdoor temperature sensor services.
-- Optional feature switches (only when supported by device model/merit flags):
-  - Eco Mode
-  - Hi Power
-  - 8C Heating
-  - Floor Mode
-  - Comfort
-  - Ionizer
-  - Self Cleaning
 - Robust error handling and detailed Homebridge logs.
+
+## RotationSpeed Mapping Profile
+
+The plugin keeps a single HomeKit `HeaterCooler` tile and maps Toshiba-specific behavior from `RotationSpeed`:
+
+- `0%` => fan `AUTO`
+- `> 0% && <= 5%` => outdoor silent (`CDU_SILENT_1`) ON
+- `> 0% && <= 10%` => indoor silent (`QUIET` fan) ON
+- `> 0% && <= 20%` => eco (`ECO`) ON
+- `100%` => high power (`HIGH_POWER`) ON
+- Power selection is derived from `RotationSpeed`:
+  - `0%` => middle (`POWER_75`)
+  - `1..33%` => `POWER_50`
+  - `34..66%` => `POWER_75`
+  - `67..100%` => `POWER_100`
+
+Note: Toshiba `Merit A` is a single field in cloud payload, so overlapping low-speed modes use precedence:
+`HIGH_POWER` > `CDU_SILENT_1` > `ECO` > `OFF`.
 
 ## Install
 
@@ -62,10 +71,7 @@ homebridge -D
   "pollIntervalSeconds": 120,
   "discoveryRefreshMinutes": 30,
   "requestTimeoutSeconds": 60,
-  "httpRetries": 5,
-  "enableFanService": true,
-  "enableFeatureSwitches": true,
-  "enableTemperatureSensors": true
+  "httpRetries": 5
 }
 ```
 
@@ -73,7 +79,8 @@ homebridge -D
 
 - This plugin controls devices via Toshiba cloud, not local LAN.
 - Real-time state updates come from cloud AMQP; polling is only a fallback.
-- Some Toshiba app modes are not directly representable by native HomeKit HVAC characteristics. When possible, they are exposed via additional HomeKit services/switches.
+- Some Toshiba app features are not directly representable by native HomeKit `HeaterCooler` characteristics and are not exposed as separate tiles/services.
+- Not mapped on purpose: `Pure`/ionizer, self-cleaning, floor/comfort/fireplace variants, and other non-`HeaterCooler` native controls.
 
 ## Development
 

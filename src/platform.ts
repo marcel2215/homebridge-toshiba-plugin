@@ -19,9 +19,6 @@ import {
   CMD_FCU_FROM_AC,
   CMD_HEARTBEAT,
   DEFAULT_DISCOVERY_REFRESH_MINUTES,
-  DEFAULT_ENABLE_FAN_SERVICE,
-  DEFAULT_ENABLE_FEATURE_SWITCHES,
-  DEFAULT_ENABLE_TEMPERATURE_SENSORS,
   DEFAULT_HTTP_RETRIES,
   DEFAULT_HTTP_TIMEOUT_MS,
   DEFAULT_STATE_POLL_INTERVAL_SECONDS,
@@ -30,7 +27,7 @@ import {
 } from './toshiba/constants.js';
 import { ToshibaAcDevice } from './toshiba/device.js';
 import { ToshibaApiError, ToshibaAuthError, ToshibaHttpApi } from './toshiba/httpApi.js';
-import type { ToshibaDeviceConnectionState, ToshibaDiscoveredDevice, ToshibaPlatformDeviceOptions } from './toshiba/types.js';
+import type { ToshibaDeviceConnectionState, ToshibaDiscoveredDevice } from './toshiba/types.js';
 
 interface ToshibaPlatformConfig extends PlatformConfig {
   username?: string;
@@ -39,9 +36,6 @@ interface ToshibaPlatformConfig extends PlatformConfig {
   discoveryRefreshMinutes?: number;
   requestTimeoutSeconds?: number;
   httpRetries?: number;
-  enableFanService?: boolean;
-  enableFeatureSwitches?: boolean;
-  enableTemperatureSensors?: boolean;
 }
 
 const MOBILE_DEVICE_ID_STORAGE_DIR = 'toshiba-smart-ac';
@@ -57,8 +51,6 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   private readonly devicesByUniqueId = new Map<string, ToshibaAcDevice>();
 
   private readonly sessionId: string;
-
-  private readonly deviceOptions: ToshibaPlatformDeviceOptions;
 
   private httpApi?: ToshibaHttpApi;
   private amqpClient?: ToshibaAmqpClient;
@@ -79,12 +71,6 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     this.sessionId = this.loadOrCreateMobileDeviceId();
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
-
-    this.deviceOptions = {
-      enableFanService: config.enableFanService ?? DEFAULT_ENABLE_FAN_SERVICE,
-      enableFeatureSwitches: config.enableFeatureSwitches ?? DEFAULT_ENABLE_FEATURE_SWITCHES,
-      enableTemperatureSensors: config.enableTemperatureSensors ?? DEFAULT_ENABLE_TEMPERATURE_SENSORS,
-    };
 
     this.log.info(`Finished initializing ${this.config.platform} platform`);
 
@@ -333,7 +319,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         if (handler) {
           handler.setDevice(device);
         } else {
-          this.accessoryHandlers.set(uuid, new ToshibaPlatformAccessory(this, existingAccessory, device, this.deviceOptions));
+          this.accessoryHandlers.set(uuid, new ToshibaPlatformAccessory(this, existingAccessory, device));
         }
 
         this.api.updatePlatformAccessories([existingAccessory]);
@@ -345,7 +331,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         accessory.context.acId = discovered.acId;
 
         this.accessories.set(uuid, accessory);
-        this.accessoryHandlers.set(uuid, new ToshibaPlatformAccessory(this, accessory, device, this.deviceOptions));
+        this.accessoryHandlers.set(uuid, new ToshibaPlatformAccessory(this, accessory, device));
 
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       }

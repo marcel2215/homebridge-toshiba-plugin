@@ -165,9 +165,3 @@ export interface ToshibaAmqpMethodPayload {
   payload: Record<string, unknown>;
   timeStamp: string;
 }
-
-export interface ToshibaPlatformDeviceOptions {
-  enableFanService: boolean;
-  enableFeatureSwitches: boolean;
-  enableTemperatureSensors: boolean;
-}

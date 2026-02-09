@@ -61,22 +61,22 @@
         "description": "Number of retries for transient cloud API failures (official app behavior is 5 retries)."
       },
       "enableFanService": {
-        "title": "Expose Fan Service",
+        "title": "Expose Fan Service (Deprecated)",
         "type": "boolean",
-        "default": true,
-        "description": "Adds an extra Fan service for fan-only mode in Home app."
+        "default": false,
+        "description": "Deprecated and ignored. Plugin now exposes a single HeaterCooler service only."
       },
       "enableFeatureSwitches": {
-        "title": "Expose Feature Switches",
+        "title": "Expose Feature Switches (Deprecated)",
         "type": "boolean",
-        "default": true,
-        "description": "Adds switch services for supported Toshiba features (Eco, Hi Power, etc.)."
+        "default": false,
+        "description": "Deprecated and ignored. Plugin now exposes a single HeaterCooler service only."
       },
       "enableTemperatureSensors": {
-        "title": "Expose Temperature Sensors",
+        "title": "Expose Temperature Sensors (Deprecated)",
         "type": "boolean",
-        "default": true,
-        "description": "Adds indoor/outdoor temperature sensor services."
+        "default": false,
+        "description": "Deprecated and ignored. Plugin now exposes a single HeaterCooler service only."
       }
     }
   }
