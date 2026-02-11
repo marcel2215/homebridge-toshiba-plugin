@@ -19,6 +19,8 @@ Homebridge dynamic platform plugin for Toshiba **Home AC Control** cloud devices
 - Automatic AMQP reconnect with exponential backoff after cloud disconnects.
 - AMQP operation timeout guards (connect/send/disconnect) with failure-triggered recovery.
 - Poll/discovery overlap protection to avoid queue buildup during slow cloud responses.
+- Per-device polling endpoint failover between `GetCurrentACStateByUniqueDeviceIdV2` and `GetCurrentACStateV2` (one device's 403 no longer forces global fallback).
+- If both polling endpoints return 403 for a device, polling is temporarily paused for that device and retried later while AMQP remains active.
 - Command coalescing (500ms debounce) to mirror native app command burst behavior.
 - No-op command suppression (skips AMQP send when requested state already matches current effective state).
 - Command preflight online check (`GetAllDeviceState`) before AMQP sends, with offline protection.

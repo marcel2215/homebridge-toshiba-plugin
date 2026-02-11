@@ -42,6 +42,18 @@ const MOBILE_DEVICE_ID_STORAGE_DIR = 'toshiba-smart-ac';
 const MOBILE_DEVICE_ID_STORAGE_FILE = 'mobile-device-id.txt';
 const STARTUP_RETRY_MAX_DELAY_MS = 5 * 60 * 1000;
 const DEVICE_CONNECTION_STATE_CACHE_TTL_MS = 5_000;
+const STATE_ENDPOINT_BOTH_FORBIDDEN_LOG_INTERVAL_MS = 30 * 60 * 1000;
+const STATE_ENDPOINT_FORBIDDEN_PROBE_INTERVAL_MS = 15 * 60 * 1000;
+
+type ToshibaStateEndpoint = 'unique' | 'acid';
+
+interface ToshibaStateEndpointStatus {
+  preferred: ToshibaStateEndpoint;
+  uniqueForbidden: boolean;
+  acIdForbidden: boolean;
+  nextForbiddenWarningAt?: number;
+  nextForbiddenProbeAt?: number;
+}
 
 export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
@@ -52,6 +64,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   private readonly accessoryHandlers = new Map<string, ToshibaPlatformAccessory>();
   private readonly devicesByUniqueId = new Map<string, ToshibaAcDevice>();
   private readonly connectionStateCache = new Map<string, { state: string; updatedAt: number }>();
+  private readonly stateEndpointByDevice = new Map<string, ToshibaStateEndpointStatus>();
 
   private readonly sessionId: string;
 
@@ -69,7 +82,6 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   private startupRetryAttempt = 0;
   private stateRefreshInProgress = false;
   private discoveryRefreshInProgress = false;
-  private uniqueStateEndpointForbidden = false;
   private additionalInfoEndpointForbidden = false;
 
   constructor(
@@ -173,6 +185,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
     await this.amqpClient.connect(registration);
     this.connectionStateCache.clear();
+    this.stateEndpointByDevice.clear();
 
     this.scheduleTokenRefresh(registration.SasToken);
   }
@@ -444,6 +457,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         device?.dispose();
         this.devicesByUniqueId.delete(uniqueId);
         this.connectionStateCache.delete(uniqueId);
+        this.stateEndpointByDevice.delete(uniqueId);
       }
     }
   }
@@ -515,29 +529,9 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     await this.queueOperation(async () => {
       for (const device of this.devicesByUniqueId.values()) {
         try {
-          let latestState: string;
-
-          if (!this.uniqueStateEndpointForbidden) {
-            try {
-              latestState = await this.httpApi!.getDeviceStateByUniqueId(device.uniqueId);
-            } catch (error) {
-              if (error instanceof ToshibaAuthError) {
-                throw error;
-              }
-
-              if (this.isHttpForbidden(error)) {
-                this.uniqueStateEndpointForbidden = true;
-                this.log.warn('[PLATFORM] Unique-device-id state endpoint returned HTTP 403; falling back to ACId state endpoint for this session');
-              } else if (error instanceof ToshibaApiError) {
-                this.log.debug(
-                  `[PLATFORM] Unique-id state fetch failed for ${device.name} (${device.uniqueId}), falling back to ACId: ${this.errorToString(error)}`,
-                );
-              }
-
-              latestState = await this.httpApi!.getDeviceState(device.id);
-            }
-          } else {
-            latestState = await this.httpApi!.getDeviceState(device.id);
+          const latestState = await this.fetchLatestStateForDevice(device);
+          if (!latestState) {
+            continue;
           }
 
           device.applyCloudState(latestState);
@@ -552,6 +546,148 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         }
       }
     });
+  }
+
+  private async fetchLatestStateForDevice(device: ToshibaAcDevice): Promise<string | undefined> {
+    if (!this.httpApi) {
+      return undefined;
+    }
+
+    const status = this.getStateEndpointStatus(device.uniqueId);
+    const now = Date.now();
+
+    if (
+      status.uniqueForbidden &&
+      status.acIdForbidden &&
+      typeof status.nextForbiddenProbeAt === 'number' &&
+      now < status.nextForbiddenProbeAt
+    ) {
+      return undefined;
+    }
+
+    if (status.uniqueForbidden && status.acIdForbidden) {
+      status.uniqueForbidden = false;
+      status.acIdForbidden = false;
+      status.nextForbiddenProbeAt = undefined;
+      this.log.debug(`[PLATFORM] Re-probing polling state endpoints for ${device.name}`);
+    }
+
+    const endpoints: ToshibaStateEndpoint[] = status.preferred === 'acid'
+      ? ['acid', 'unique']
+      : ['unique', 'acid'];
+
+    let lastError: unknown;
+    for (const endpoint of endpoints) {
+      if ((endpoint === 'unique' && status.uniqueForbidden) || (endpoint === 'acid' && status.acIdForbidden)) {
+        continue;
+      }
+
+      try {
+        const latestState = endpoint === 'unique'
+          ? await this.httpApi.getDeviceStateByUniqueId(device.uniqueId)
+          : await this.httpApi.getDeviceState(device.id);
+
+        if (status.preferred !== endpoint) {
+          this.log.info(
+            `[PLATFORM] ${device.name}: switched polling state endpoint to ${this.describeStateEndpoint(endpoint)}`,
+          );
+        }
+        status.preferred = endpoint;
+        status.nextForbiddenWarningAt = undefined;
+        status.nextForbiddenProbeAt = undefined;
+        if (endpoint === 'unique') {
+          status.uniqueForbidden = false;
+        } else {
+          status.acIdForbidden = false;
+        }
+
+        this.stateEndpointByDevice.set(device.uniqueId, status);
+        return latestState;
+      } catch (error) {
+        if (error instanceof ToshibaAuthError) {
+          throw error;
+        }
+
+        lastError = error;
+        if (this.isHttpForbidden(error)) {
+          this.markStateEndpointForbidden(status, endpoint, device.name);
+          continue;
+        }
+
+        if (error instanceof ToshibaApiError) {
+          const endpointLabel = this.describeStateEndpoint(endpoint);
+          const reason = this.errorToString(error);
+          this.log.debug(
+            `[PLATFORM] ${endpointLabel} state fetch failed for ${device.name} ` +
+            `(${device.uniqueId}); trying alternate endpoint: ${reason}`,
+          );
+          continue;
+        }
+
+        break;
+      }
+    }
+
+    this.stateEndpointByDevice.set(device.uniqueId, status);
+    if (status.uniqueForbidden && status.acIdForbidden) {
+      this.handleBothPollingStateEndpointsForbidden(status, device.name);
+      return undefined;
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
+    return undefined;
+  }
+
+  private getStateEndpointStatus(uniqueId: string): ToshibaStateEndpointStatus {
+    const existing = this.stateEndpointByDevice.get(uniqueId);
+    if (existing) {
+      return existing;
+    }
+
+    const created: ToshibaStateEndpointStatus = {
+      preferred: 'unique',
+      uniqueForbidden: false,
+      acIdForbidden: false,
+    };
+    this.stateEndpointByDevice.set(uniqueId, created);
+    return created;
+  }
+
+  private markStateEndpointForbidden(
+    status: ToshibaStateEndpointStatus,
+    endpoint: ToshibaStateEndpoint,
+    deviceName: string,
+  ): void {
+    if (endpoint === 'unique') {
+      if (!status.uniqueForbidden) {
+        this.log.warn(`[PLATFORM] ${deviceName}: unique-device-id state endpoint returned HTTP 403; trying ACId endpoint`);
+      }
+      status.uniqueForbidden = true;
+      return;
+    }
+
+    if (!status.acIdForbidden) {
+      this.log.warn(`[PLATFORM] ${deviceName}: ACId state endpoint returned HTTP 403; trying unique-device-id endpoint`);
+    }
+    status.acIdForbidden = true;
+  }
+
+  private handleBothPollingStateEndpointsForbidden(status: ToshibaStateEndpointStatus, deviceName: string): void {
+    const now = Date.now();
+    if (!status.nextForbiddenWarningAt || now >= status.nextForbiddenWarningAt) {
+      this.log.warn(
+        `[PLATFORM] ${deviceName}: both polling state endpoints returned HTTP 403; polling paused and AMQP updates will be used`,
+      );
+      status.nextForbiddenWarningAt = now + STATE_ENDPOINT_BOTH_FORBIDDEN_LOG_INTERVAL_MS;
+    }
+    status.nextForbiddenProbeAt = now + STATE_ENDPOINT_FORBIDDEN_PROBE_INTERVAL_MS;
+  }
+
+  private describeStateEndpoint(endpoint: ToshibaStateEndpoint): string {
+    return endpoint === 'unique' ? 'unique-device-id' : 'ACId';
   }
 
   private handleCloudStateUpdate(sourceId: string, payload: Record<string, unknown>): void {
@@ -695,6 +831,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     }
     this.devicesByUniqueId.clear();
     this.connectionStateCache.clear();
+    this.stateEndpointByDevice.clear();
 
     if (this.amqpClient) {
       await this.amqpClient.disconnect();
