@@ -44,6 +44,14 @@ const STARTUP_RETRY_MAX_DELAY_MS = 5 * 60 * 1000;
 const DEVICE_CONNECTION_STATE_CACHE_TTL_MS = 5_000;
 const STATE_ENDPOINT_BOTH_FORBIDDEN_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const STATE_ENDPOINT_FORBIDDEN_PROBE_INTERVAL_MS = 15 * 60 * 1000;
+const MIN_POLL_INTERVAL_SECONDS = 30;
+const MAX_POLL_INTERVAL_SECONDS = 3600;
+const MIN_DISCOVERY_REFRESH_MINUTES = 5;
+const MAX_DISCOVERY_REFRESH_MINUTES = 1440;
+const MIN_REQUEST_TIMEOUT_SECONDS = 5;
+const MAX_REQUEST_TIMEOUT_SECONDS = 120;
+const MIN_HTTP_RETRIES = 0;
+const MAX_HTTP_RETRIES = 10;
 
 type ToshibaStateEndpoint = 'unique' | 'acid';
 
@@ -127,11 +135,26 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     }
 
     if (!this.httpApi) {
+      const requestTimeoutSeconds = this.normalizeIntegerConfig(
+        this.config.requestTimeoutSeconds,
+        DEFAULT_HTTP_TIMEOUT_MS / 1000,
+        MIN_REQUEST_TIMEOUT_SECONDS,
+        MAX_REQUEST_TIMEOUT_SECONDS,
+        'requestTimeoutSeconds',
+      );
+      const httpRetries = this.normalizeIntegerConfig(
+        this.config.httpRetries,
+        DEFAULT_HTTP_RETRIES,
+        MIN_HTTP_RETRIES,
+        MAX_HTTP_RETRIES,
+        'httpRetries',
+      );
+
       this.httpApi = new ToshibaHttpApi(this.log, {
         username,
         password,
-        timeoutMs: Math.max(1_000, (this.config.requestTimeoutSeconds ?? (DEFAULT_HTTP_TIMEOUT_MS / 1000)) * 1_000),
-        retries: this.config.httpRetries ?? DEFAULT_HTTP_RETRIES,
+        timeoutMs: requestTimeoutSeconds * 1_000,
+        retries: httpRetries,
       });
     }
 
@@ -156,10 +179,18 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         await this.discoverDevices();
       });
 
+      if (this.isShuttingDown) {
+        return;
+      }
+
       this.startupRetryAttempt = 0;
       this.startStatePolling();
       this.startDiscoveryRefresh();
     } catch (error) {
+      if (this.isShuttingDown) {
+        return;
+      }
+
       if (error instanceof ToshibaAuthError) {
         this.log.error('[PLATFORM] Toshiba authentication failed. Verify username/password in config.');
         return;
@@ -174,18 +205,32 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   }
 
   private async connectCloud(): Promise<void> {
-    if (!this.httpApi || !this.amqpClient) {
+    const httpApi = this.httpApi;
+    const amqpClient = this.amqpClient;
+    if (!httpApi || !amqpClient) {
       throw new Error('Platform not initialized');
     }
 
     this.log.info('[PLATFORM] Connecting to Toshiba cloud API');
 
-    await this.httpApi.login();
-    const registration = await this.httpApi.registerMobileClient(this.sessionId);
+    await httpApi.login();
+    if (this.isShuttingDown) {
+      return;
+    }
 
-    await this.amqpClient.connect(registration);
+    const registration = await httpApi.registerMobileClient(this.sessionId);
+    if (this.isShuttingDown) {
+      return;
+    }
+
+    await amqpClient.connect(registration);
+    if (this.isShuttingDown) {
+      return;
+    }
+
     this.connectionStateCache.clear();
     this.stateEndpointByDevice.clear();
+    this.additionalInfoEndpointForbidden = false;
 
     this.scheduleTokenRefresh(registration.SasToken);
   }
@@ -197,11 +242,32 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
     await this.queueOperation(async () => {
       try {
-        const registration = await this.httpApi!.registerMobileClient(this.sessionId);
-        await this.amqpClient!.connect(registration);
+        const httpApi = this.httpApi;
+        if (!httpApi || this.isShuttingDown) {
+          return;
+        }
+
+        const registration = await httpApi.registerMobileClient(this.sessionId);
+
+        const amqpClient = this.amqpClient;
+        if (!amqpClient || this.isShuttingDown) {
+          this.log.debug('[PLATFORM] Skipping cloud registration refresh apply: platform is shutting down');
+          return;
+        }
+
+        await amqpClient.connect(registration);
+
+        if (this.isShuttingDown) {
+          return;
+        }
+
         this.scheduleTokenRefresh(registration.SasToken);
         this.log.info('[PLATFORM] Refreshed Toshiba cloud registration');
       } catch (error) {
+        if (this.isShuttingDown) {
+          return;
+        }
+
         if (error instanceof ToshibaAuthError) {
           this.log.warn('[PLATFORM] Token refresh rejected by cloud auth; reconnecting full session');
           try {
@@ -256,6 +322,10 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   }
 
   private scheduleTokenRefresh(sasToken?: string): void {
+    if (this.isShuttingDown) {
+      return;
+    }
+
     if (this.tokenRefreshTimer) {
       clearTimeout(this.tokenRefreshTimer);
       this.tokenRefreshTimer = undefined;
@@ -282,6 +352,10 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   }
 
   private scheduleTokenRefreshRetry(): void {
+    if (this.isShuttingDown) {
+      return;
+    }
+
     if (this.tokenRefreshTimer) {
       clearTimeout(this.tokenRefreshTimer);
       this.tokenRefreshTimer = undefined;
@@ -343,16 +417,24 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     const discoveredUniqueIds = new Set<string>();
 
     for (const discovered of discoveredDevices) {
-      if (discoveredUniqueIds.has(discovered.uniqueId)) {
+      const uniqueIdKey = this.normalizeCloudIdentifier(discovered.uniqueId);
+      if (!uniqueIdKey) {
+        this.log.warn(`[PLATFORM] Skipping discovered device with malformed uniqueId (${discovered.name})`);
+        continue;
+      }
+
+      if (discoveredUniqueIds.has(uniqueIdKey)) {
         this.log.warn(`[PLATFORM] Duplicate discovered device uniqueId ${discovered.uniqueId}; skipping duplicate entry (${discovered.name})`);
         continue;
       }
-      discoveredUniqueIds.add(discovered.uniqueId);
+      discoveredUniqueIds.add(uniqueIdKey);
 
       try {
+        let device = this.devicesByUniqueId.get(uniqueIdKey);
+        const shouldFetchAdditionalInfo = !device || !device.hasAdditionalInfo;
         let additionalInfo;
 
-        if (!this.additionalInfoEndpointForbidden) {
+        if (shouldFetchAdditionalInfo && !this.additionalInfoEndpointForbidden) {
           try {
             additionalInfo = await this.httpApi.getDeviceAdditionalInfo(discovered.acId, discovered.uniqueId);
           } catch (error) {
@@ -364,21 +446,20 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
               } catch (retryError) {
                 if (this.isHttpForbidden(retryError)) {
                   this.additionalInfoEndpointForbidden = true;
-                  this.log.warn('[PLATFORM] Additional-info endpoint returned HTTP 403; disabling additional-info fetches for this session');
+                  this.log.info('[PLATFORM] Additional-info endpoint returned HTTP 403; disabling additional-info fetches for this session');
                 } else {
                   this.log.warn(`[PLATFORM] Failed to fetch additional info for ${discovered.name}: ${this.errorToString(retryError)}`);
                 }
               }
             } else if (this.isHttpForbidden(error)) {
               this.additionalInfoEndpointForbidden = true;
-              this.log.warn('[PLATFORM] Additional-info endpoint returned HTTP 403; disabling additional-info fetches for this session');
+              this.log.info('[PLATFORM] Additional-info endpoint returned HTTP 403; disabling additional-info fetches for this session');
             } else {
               this.log.warn(`[PLATFORM] Failed to fetch additional info for ${discovered.name}: ${this.errorToString(error)}`);
             }
           }
         }
 
-        let device = this.devicesByUniqueId.get(discovered.uniqueId);
         if (!device) {
           device = new ToshibaAcDevice(
             this.log,
@@ -387,21 +468,21 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
             additionalInfo,
             async (uniqueId, name) => this.ensureDeviceOnline(uniqueId, name),
           );
-          this.devicesByUniqueId.set(discovered.uniqueId, device);
+          this.devicesByUniqueId.set(uniqueIdKey, device);
         } else {
           device.updateIdentity(discovered.name);
           device.updateAdditionalInfo(additionalInfo);
           device.applyCloudState(discovered.stateHex);
         }
 
-        const uuid = this.api.hap.uuid.generate(`toshiba-smart-ac:${discovered.uniqueId}`);
+        const uuid = this.api.hap.uuid.generate(`toshiba-smart-ac:${uniqueIdKey}`);
         discoveredAccessoryUuids.add(uuid);
 
         const existingAccessory = this.accessories.get(uuid);
         if (existingAccessory) {
           this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
 
-          existingAccessory.context.uniqueId = discovered.uniqueId;
+          existingAccessory.context.uniqueId = uniqueIdKey;
           existingAccessory.context.acId = discovered.acId;
 
           const handler = this.accessoryHandlers.get(uuid);
@@ -416,13 +497,28 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
           this.log.info('Adding new accessory:', discovered.name);
 
           const accessory = new this.api.platformAccessory(discovered.name, uuid);
-          accessory.context.uniqueId = discovered.uniqueId;
+          accessory.context.uniqueId = uniqueIdKey;
           accessory.context.acId = discovered.acId;
 
           this.accessories.set(uuid, accessory);
           this.accessoryHandlers.set(uuid, new ToshibaPlatformAccessory(this, accessory, device));
 
-          this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+          try {
+            this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+          } catch (error) {
+            if (!this.isAlreadyBridgedAccessoryError(error)) {
+              const failedHandler = this.accessoryHandlers.get(uuid);
+              failedHandler?.dispose?.();
+              this.accessoryHandlers.delete(uuid);
+              this.accessories.delete(uuid);
+              throw error;
+            }
+
+            // Homebridge v2 can pre-bridge platform accessories before explicit registration.
+            // Keep the accessory active and persist context without surfacing noisy startup errors.
+            this.log.debug(`[PLATFORM] Accessory ${accessory.displayName} was already bridged; continuing`);
+            this.api.updatePlatformAccessories([accessory]);
+          }
         }
       } catch (error) {
         this.log.error(
@@ -453,9 +549,16 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
       const uniqueId = accessory.context.uniqueId;
       if (typeof uniqueId === 'string') {
-        const device = this.devicesByUniqueId.get(uniqueId);
+        const uniqueIdKey = this.normalizeCloudIdentifier(uniqueId);
+        const device = this.devicesByUniqueId.get(uniqueIdKey);
         device?.dispose();
-        this.devicesByUniqueId.delete(uniqueId);
+        this.devicesByUniqueId.delete(uniqueIdKey);
+        if (device) {
+          this.connectionStateCache.delete(device.uniqueId);
+          this.stateEndpointByDevice.delete(device.uniqueId);
+        }
+        this.connectionStateCache.delete(uniqueIdKey);
+        this.stateEndpointByDevice.delete(uniqueIdKey);
         this.connectionStateCache.delete(uniqueId);
         this.stateEndpointByDevice.delete(uniqueId);
       }
@@ -468,7 +571,14 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       this.statePollTimer = undefined;
     }
 
-    const pollIntervalMs = Math.max(30, this.config.pollIntervalSeconds ?? DEFAULT_STATE_POLL_INTERVAL_SECONDS) * 1000;
+    const pollIntervalSeconds = this.normalizeIntegerConfig(
+      this.config.pollIntervalSeconds,
+      DEFAULT_STATE_POLL_INTERVAL_SECONDS,
+      MIN_POLL_INTERVAL_SECONDS,
+      MAX_POLL_INTERVAL_SECONDS,
+      'pollIntervalSeconds',
+    );
+    const pollIntervalMs = pollIntervalSeconds * 1000;
 
     this.log.info(`[PLATFORM] Enabled state polling every ${Math.round(pollIntervalMs / 1000)} seconds`);
 
@@ -494,7 +604,13 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       this.discoveryRefreshTimer = undefined;
     }
 
-    const intervalMinutes = Math.max(5, this.config.discoveryRefreshMinutes ?? DEFAULT_DISCOVERY_REFRESH_MINUTES);
+    const intervalMinutes = this.normalizeIntegerConfig(
+      this.config.discoveryRefreshMinutes,
+      DEFAULT_DISCOVERY_REFRESH_MINUTES,
+      MIN_DISCOVERY_REFRESH_MINUTES,
+      MAX_DISCOVERY_REFRESH_MINUTES,
+      'discoveryRefreshMinutes',
+    );
     const intervalMs = intervalMinutes * 60 * 1000;
 
     this.discoveryRefreshTimer = setInterval(() => {
@@ -593,13 +709,12 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
           );
         }
         status.preferred = endpoint;
+        // A successful state fetch proves at least one path is currently valid.
+        // Clear stale endpoint-forbidden flags so future failover can react immediately.
+        status.uniqueForbidden = false;
+        status.acIdForbidden = false;
         status.nextForbiddenWarningAt = undefined;
         status.nextForbiddenProbeAt = undefined;
-        if (endpoint === 'unique') {
-          status.uniqueForbidden = false;
-        } else {
-          status.acIdForbidden = false;
-        }
 
         this.stateEndpointByDevice.set(device.uniqueId, status);
         return latestState;
@@ -663,14 +778,14 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   ): void {
     if (endpoint === 'unique') {
       if (!status.uniqueForbidden) {
-        this.log.warn(`[PLATFORM] ${deviceName}: unique-device-id state endpoint returned HTTP 403; trying ACId endpoint`);
+        this.log.info(`[PLATFORM] ${deviceName}: unique-device-id state endpoint returned HTTP 403; trying ACId endpoint`);
       }
       status.uniqueForbidden = true;
       return;
     }
 
     if (!status.acIdForbidden) {
-      this.log.warn(`[PLATFORM] ${deviceName}: ACId state endpoint returned HTTP 403; trying unique-device-id endpoint`);
+      this.log.info(`[PLATFORM] ${deviceName}: ACId state endpoint returned HTTP 403; trying unique-device-id endpoint`);
     }
     status.acIdForbidden = true;
   }
@@ -678,7 +793,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   private handleBothPollingStateEndpointsForbidden(status: ToshibaStateEndpointStatus, deviceName: string): void {
     const now = Date.now();
     if (!status.nextForbiddenWarningAt || now >= status.nextForbiddenWarningAt) {
-      this.log.warn(
+      this.log.info(
         `[PLATFORM] ${deviceName}: both polling state endpoints returned HTTP 403; polling paused and AMQP updates will be used`,
       );
       status.nextForbiddenWarningAt = now + STATE_ENDPOINT_BOTH_FORBIDDEN_LOG_INTERVAL_MS;
@@ -691,7 +806,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   }
 
   private handleCloudStateUpdate(sourceId: string, payload: Record<string, unknown>): void {
-    const device = this.devicesByUniqueId.get(sourceId);
+    const device = this.findDeviceByCloudSourceId(sourceId);
     if (!device) {
       this.log.debug(`[AMQP API] Ignoring cloud state update for unknown device: ${sourceId}`);
       return;
@@ -711,7 +826,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   }
 
   private handleCloudHeartbeat(sourceId: string, payload: Record<string, unknown>): void {
-    const device = this.devicesByUniqueId.get(sourceId);
+    const device = this.findDeviceByCloudSourceId(sourceId);
     if (!device) {
       this.log.debug(`[AMQP API] Ignoring heartbeat for unknown device: ${sourceId}`);
       return;
@@ -726,7 +841,15 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
   private async queueOperation(operation: () => Promise<void>): Promise<void> {
     // Serialize cloud operations so login/discovery/polling never race each other.
-    const queued = this.operationQueue.then(operation, operation);
+    const run = async (): Promise<void> => {
+      if (this.isShuttingDown) {
+        return;
+      }
+
+      await operation();
+    };
+
+    const queued = this.operationQueue.then(run, run);
     this.operationQueue = queued.catch(() => undefined);
     return queued;
   }
@@ -738,7 +861,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
     const cachedState = this.connectionStateCache.get(uniqueId);
     if (cachedState && (Date.now() - cachedState.updatedAt) <= DEVICE_CONNECTION_STATE_CACHE_TTL_MS) {
-      if (cachedState.state === 'Connected') {
+      if (this.isConnectedState(cachedState.state)) {
         return;
       }
 
@@ -753,7 +876,15 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         this.log.warn(`[PLATFORM] Auth expired before command precheck for ${deviceName}; reconnecting cloud session`);
 
         try {
-          await this.connectCloud();
+          await this.queueOperation(async () => {
+            await this.connectCloud();
+          });
+
+          if (!this.httpApi || this.isShuttingDown) {
+            this.log.warn(`[PLATFORM] Skipping device online precheck retry for ${deviceName}; platform is shutting down`);
+            return;
+          }
+
           states = await this.httpApi.getDeviceConnectionStates([uniqueId]);
         } catch (retryError) {
           this.log.warn(
@@ -768,14 +899,18 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         return;
       }
     }
-    const state = states.find(item => item.DeviceId === uniqueId);
+    const normalizedUniqueId = this.normalizeCloudIdentifier(uniqueId);
+    const state = states.find(item => (
+      typeof item.DeviceId === 'string' &&
+      this.normalizeCloudIdentifier(item.DeviceId) === normalizedUniqueId
+    ));
 
     if (!state) {
       this.log.warn(`[PLATFORM] Device connection state missing for ${deviceName}; allowing command`);
       return;
     }
 
-    const connectionState = typeof state.ConnectionState === 'string' ? state.ConnectionState : '';
+    const connectionState = typeof state.ConnectionState === 'string' ? state.ConnectionState.trim() : '';
     if (!connectionState) {
       this.log.warn(`[PLATFORM] Device connection state malformed for ${deviceName}; allowing command`);
       return;
@@ -786,7 +921,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       updatedAt: Date.now(),
     });
 
-    if (connectionState === 'Connected') {
+    if (this.isConnectedState(connectionState)) {
       return;
     }
 
@@ -881,8 +1016,86 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     return error instanceof ToshibaApiError && error.httpStatus === 403;
   }
 
+  private isAlreadyBridgedAccessoryError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const message = error.message.toLowerCase();
+    return message.includes('already bridged');
+  }
+
   private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise(resolve => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    });
+  }
+
+  private isConnectedState(state: string): boolean {
+    const normalized = state.trim().toLowerCase();
+    return normalized === 'connected' || normalized === 'online';
+  }
+
+  private findDeviceByCloudSourceId(sourceId: string): ToshibaAcDevice | undefined {
+    const normalized = this.normalizeCloudIdentifier(sourceId);
+    if (!normalized) {
+      return undefined;
+    }
+
+    const exact = this.devicesByUniqueId.get(normalized);
+    if (exact) {
+      return exact;
+    }
+
+    for (const device of this.devicesByUniqueId.values()) {
+      if (
+        this.normalizeCloudIdentifier(device.uniqueId) === normalized ||
+        this.normalizeCloudIdentifier(device.id) === normalized
+      ) {
+        return device;
+      }
+    }
+
+    return undefined;
+  }
+
+  private normalizeCloudIdentifier(value: string): string {
+    const trimmed = value.trim();
+    const withoutBraces = trimmed.replace(/^\{+|\}+$/g, '');
+    return withoutBraces.toLowerCase();
+  }
+
+  private normalizeIntegerConfig(
+    value: unknown,
+    fallback: number,
+    min: number,
+    max: number,
+    key: string,
+  ): number {
+    let parsed: number;
+    if (typeof value === 'number') {
+      parsed = value;
+    } else if (typeof value === 'string' && value.trim().length > 0) {
+      parsed = Number(value.trim());
+    } else {
+      parsed = Number.NaN;
+    }
+
+    if (!Number.isFinite(parsed)) {
+      if (typeof value !== 'undefined') {
+        this.log.warn(`[PLATFORM] Invalid config "${key}" value "${String(value)}"; using default ${fallback}`);
+      }
+      return fallback;
+    }
+
+    const rounded = Math.round(parsed);
+    const bounded = Math.max(min, Math.min(max, rounded));
+    if (bounded !== rounded) {
+      this.log.warn(`[PLATFORM] Config "${key}" out of range (${rounded}); clamped to ${bounded}`);
+    }
+
+    return bounded;
   }
 
   private scheduleStartupRetry(delayMs: number): void {

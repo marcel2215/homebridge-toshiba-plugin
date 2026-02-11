@@ -153,6 +153,10 @@ export class ToshibaAcDevice {
     return this.fcuModelName;
   }
 
+  get hasAdditionalInfo(): boolean {
+    return Boolean(this.cduModelName || this.cduSerialNumber || this.fcuModelName || this.fcuSerialNumber);
+  }
+
   updateIdentity(name: string): void {
     this.name = name;
   }

@@ -380,6 +380,7 @@ export class ToshibaHttpApi {
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    timeout.unref?.();
 
     try {
       const method = opts?.body ? 'POST' : 'GET';
@@ -446,7 +447,10 @@ export class ToshibaHttpApi {
   }
 
   private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise(resolve => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    });
   }
 
   private parseRetryAfterMs(value: string | null): number | undefined {

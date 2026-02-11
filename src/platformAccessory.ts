@@ -99,6 +99,7 @@ export class ToshibaPlatformAccessory {
       .onGet(async () => this.getCurrentHeaterCoolerStateValue());
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.TargetHeaterCoolerState)
+      .setProps({ validValues: this.supportedTargetHeaterCoolerStateValues() })
       .onGet(async () => this.getTargetHeaterCoolerStateValue())
       .onSet(async (value) => this.wrapSet(async () => this.setTargetHeaterCoolerStateValue(value)));
 
@@ -131,6 +132,8 @@ export class ToshibaPlatformAccessory {
 
   private refreshFromDevice(): void {
     this.refreshServiceNames();
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.TargetHeaterCoolerState)
+      .setProps({ validValues: this.supportedTargetHeaterCoolerStateValues() });
 
     this.heaterCoolerService.updateCharacteristic(this.platform.Characteristic.Active, this.getActiveValue());
     this.heaterCoolerService.updateCharacteristic(this.platform.Characteristic.CurrentHeaterCoolerState, this.getCurrentHeaterCoolerStateValue());
@@ -208,26 +211,36 @@ export class ToshibaPlatformAccessory {
   private getTargetHeaterCoolerStateValue(): number {
     switch (this.device.mode) {
     case ToshibaAcMode.COOL:
-      return this.platform.Characteristic.TargetHeaterCoolerState.COOL;
+      if (this.isModeSupported(ToshibaAcMode.COOL)) {
+        return this.platform.Characteristic.TargetHeaterCoolerState.COOL;
+      }
+      break;
     case ToshibaAcMode.HEAT:
-      return this.platform.Characteristic.TargetHeaterCoolerState.HEAT;
+      if (this.isModeSupported(ToshibaAcMode.HEAT)) {
+        return this.platform.Characteristic.TargetHeaterCoolerState.HEAT;
+      }
+      break;
     default:
-      return this.platform.Characteristic.TargetHeaterCoolerState.AUTO;
+      if (this.isModeSupported(ToshibaAcMode.AUTO)) {
+        return this.platform.Characteristic.TargetHeaterCoolerState.AUTO;
+      }
+      break;
     }
+
+    return this.fallbackTargetHeaterCoolerStateValue();
   }
 
   private async setTargetHeaterCoolerStateValue(value: CharacteristicValue): Promise<void> {
-    switch (Number(value)) {
-    case this.platform.Characteristic.TargetHeaterCoolerState.COOL:
-      await this.device.setMode(ToshibaAcMode.COOL);
-      return;
-    case this.platform.Characteristic.TargetHeaterCoolerState.HEAT:
-      await this.device.setMode(ToshibaAcMode.HEAT);
-      return;
-    default:
-      await this.device.setMode(ToshibaAcMode.AUTO);
+    const requested = Number(value);
+    const targetMode = this.modeFromTargetHeaterCoolerState(requested);
+    if (!targetMode) {
+      this.platform.log.warn(
+        `[ACCESSORY] ${this.device.name}: unsupported TargetHeaterCoolerState=${requested}; skipping mode change`,
+      );
       return;
     }
+
+    await this.device.setMode(targetMode);
   }
 
   private getCurrentTemperatureValue(): number {
@@ -327,17 +340,40 @@ export class ToshibaPlatformAccessory {
   }
 
   private getSwingModeValue(): number {
-    return this.device.swingMode !== ToshibaAcSwingMode.OFF
+    return (
+      this.device.swingMode !== ToshibaAcSwingMode.OFF &&
+      this.device.swingMode !== ToshibaAcSwingMode.NONE
+    )
       ? this.platform.Characteristic.SwingMode.SWING_ENABLED
       : this.platform.Characteristic.SwingMode.SWING_DISABLED;
   }
 
   private async setSwingModeValue(value: CharacteristicValue): Promise<void> {
     const enabled = Number(value) === this.platform.Characteristic.SwingMode.SWING_ENABLED;
-    await this.device.setSwingMode(enabled ? this.preferredEnabledSwingMode() : ToshibaAcSwingMode.OFF);
+    if (!enabled) {
+      if (!this.device.supported.acSwingMode.includes(ToshibaAcSwingMode.OFF)) {
+        this.platform.log.warn(
+          `[ACCESSORY] ${this.device.name}: swing disable requested but OFF mode is unsupported; skipping command`,
+        );
+        return;
+      }
+
+      await this.device.setSwingMode(ToshibaAcSwingMode.OFF);
+      return;
+    }
+
+    const preferred = this.preferredEnabledSwingMode();
+    if (!preferred) {
+      this.platform.log.warn(
+        `[ACCESSORY] ${this.device.name}: swing enable requested but no supported swing mode is available; skipping command`,
+      );
+      return;
+    }
+
+    await this.device.setSwingMode(preferred);
   }
 
-  private preferredEnabledSwingMode(): ToshibaAcSwingMode {
+  private preferredEnabledSwingMode(): ToshibaAcSwingMode | undefined {
     if (this.device.supported.acSwingMode.includes(ToshibaAcSwingMode.SWING_VERTICAL_AND_HORIZONTAL)) {
       return ToshibaAcSwingMode.SWING_VERTICAL_AND_HORIZONTAL;
     }
@@ -350,7 +386,11 @@ export class ToshibaPlatformAccessory {
       return ToshibaAcSwingMode.SWING_HORIZONTAL;
     }
 
-    return ToshibaAcSwingMode.FIXED_1;
+    if (this.device.supported.acSwingMode.includes(ToshibaAcSwingMode.FIXED_1)) {
+      return ToshibaAcSwingMode.FIXED_1;
+    }
+
+    return undefined;
   }
 
   private normalizeCurrentTemperature(value: number): number {
@@ -434,6 +474,79 @@ export class ToshibaPlatformAccessory {
     }
 
     return ToshibaAcPowerSelection.POWER_100;
+  }
+
+  private supportedTargetHeaterCoolerStateValues(): number[] {
+    const values: number[] = [];
+
+    if (this.isModeSupported(ToshibaAcMode.AUTO)) {
+      values.push(this.platform.Characteristic.TargetHeaterCoolerState.AUTO);
+    }
+    if (this.isModeSupported(ToshibaAcMode.HEAT)) {
+      values.push(this.platform.Characteristic.TargetHeaterCoolerState.HEAT);
+    }
+    if (this.isModeSupported(ToshibaAcMode.COOL)) {
+      values.push(this.platform.Characteristic.TargetHeaterCoolerState.COOL);
+    }
+
+    if (values.length > 0) {
+      return values;
+    }
+
+    // Defensive fallback for malformed capability payloads: keep UI stable with one safe value.
+    return [this.platform.Characteristic.TargetHeaterCoolerState.AUTO];
+  }
+
+  private fallbackTargetHeaterCoolerStateValue(): number {
+    if (this.isModeSupported(ToshibaAcMode.AUTO)) {
+      return this.platform.Characteristic.TargetHeaterCoolerState.AUTO;
+    }
+
+    if (this.isModeSupported(ToshibaAcMode.COOL)) {
+      return this.platform.Characteristic.TargetHeaterCoolerState.COOL;
+    }
+
+    if (this.isModeSupported(ToshibaAcMode.HEAT)) {
+      return this.platform.Characteristic.TargetHeaterCoolerState.HEAT;
+    }
+
+    return this.platform.Characteristic.TargetHeaterCoolerState.AUTO;
+  }
+
+  private modeFromTargetHeaterCoolerState(value: number): ToshibaAcMode | undefined {
+    if (value === this.platform.Characteristic.TargetHeaterCoolerState.COOL) {
+      return this.isModeSupported(ToshibaAcMode.COOL) ? ToshibaAcMode.COOL : undefined;
+    }
+
+    if (value === this.platform.Characteristic.TargetHeaterCoolerState.HEAT) {
+      return this.isModeSupported(ToshibaAcMode.HEAT) ? ToshibaAcMode.HEAT : undefined;
+    }
+
+    if (value === this.platform.Characteristic.TargetHeaterCoolerState.AUTO) {
+      if (this.isModeSupported(ToshibaAcMode.AUTO)) {
+        return ToshibaAcMode.AUTO;
+      }
+      // If AUTO is unsupported, preserve the currently active controllable mode first.
+      if (this.device.mode === ToshibaAcMode.COOL && this.isModeSupported(ToshibaAcMode.COOL)) {
+        return ToshibaAcMode.COOL;
+      }
+      if (this.device.mode === ToshibaAcMode.HEAT && this.isModeSupported(ToshibaAcMode.HEAT)) {
+        return ToshibaAcMode.HEAT;
+      }
+      if (this.isModeSupported(ToshibaAcMode.COOL)) {
+        return ToshibaAcMode.COOL;
+      }
+      if (this.isModeSupported(ToshibaAcMode.HEAT)) {
+        return ToshibaAcMode.HEAT;
+      }
+      return undefined;
+    }
+
+    return undefined;
+  }
+
+  private isModeSupported(mode: ToshibaAcMode): boolean {
+    return this.device.supported.acMode.includes(mode);
   }
 
   private getPreferredRotationSpeedValue(): number | undefined {

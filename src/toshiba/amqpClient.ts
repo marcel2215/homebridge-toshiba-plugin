@@ -207,27 +207,35 @@ export class ToshibaAmqpClient {
   }
 
   private async handleMethodRequest(request: DeviceMethodRequest, response: DeviceMethodResponse): Promise<void> {
-    if (!request || typeof request.payload !== 'object' || request.payload === null) {
+    const payload = this.normalizeMethodPayload(request?.payload);
+    if (!payload) {
+      this.log.warn('[AMQP API] Received malformed method payload; expected JSON object');
       this.sendMethodResponse(response, 400);
       return;
     }
 
-    const payload = request.payload as Record<string, unknown>;
-    const command = payload.cmd;
-
-    if (typeof command !== 'string') {
+    const command = this.readPayloadString(payload, 'cmd');
+    if (!command) {
       this.sendMethodResponse(response, 400);
       return;
     }
 
-    const innerPayload = payload.payload;
+    const innerPayload = this.readPayloadObject(payload, 'payload');
+    const sourceId = this.readPayloadString(payload, 'sourceId') ?? '';
+    const messageId = this.readPayloadString(payload, 'messageId') ?? '';
+    const timeStamp = this.readPayloadString(payload, 'timeStamp') ?? '';
+    const targetIdRaw = this.readPayloadValue(payload, 'targetId');
+    const targetId = Array.isArray(targetIdRaw)
+      ? targetIdRaw
+      : (typeof targetIdRaw === 'string' && targetIdRaw.length > 0 ? [targetIdRaw] : []);
+
     const normalizedPayload: ToshibaAmqpMethodPayload = {
-      sourceId: typeof payload.sourceId === 'string' ? payload.sourceId : '',
-      messageId: typeof payload.messageId === 'string' ? payload.messageId : '',
-      targetId: Array.isArray(payload.targetId) ? payload.targetId : [],
+      sourceId,
+      messageId,
+      targetId,
       cmd: command,
-      payload: typeof innerPayload === 'object' && innerPayload !== null ? innerPayload as Record<string, unknown> : {},
-      timeStamp: typeof payload.timeStamp === 'string' ? payload.timeStamp : '',
+      payload: innerPayload ?? {},
+      timeStamp,
     };
 
     const handler = this.handlers.get(command);
@@ -263,7 +271,10 @@ export class ToshibaAmqpClient {
   }
 
   private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise(resolve => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    });
   }
 
   private withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
@@ -301,5 +312,72 @@ export class ToshibaAmqpClient {
     const seconds = now.getUTCSeconds().toString().padStart(2, '0');
     const fractional = (now.getUTCMilliseconds() * 10_000).toString().padStart(7, '0');
     return `${hours}:${minutes}:${seconds}.${fractional}`;
+  }
+
+  private normalizeMethodPayload(rawPayload: unknown): Record<string, unknown> | undefined {
+    if (rawPayload instanceof Uint8Array) {
+      return this.parseObjectPayload(Buffer.from(rawPayload).toString('utf8'));
+    }
+
+    if (typeof rawPayload === 'string') {
+      return this.parseObjectPayload(rawPayload);
+    }
+
+    if (typeof rawPayload === 'object' && rawPayload !== null && !Array.isArray(rawPayload)) {
+      return rawPayload as Record<string, unknown>;
+    }
+
+    return undefined;
+  }
+
+  private parseObjectPayload(rawPayload: string): Record<string, unknown> | undefined {
+    const trimmed = rawPayload.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // fall through
+    }
+
+    return undefined;
+  }
+
+  private readPayloadValue(payload: Record<string, unknown>, key: string): unknown {
+    if (Object.prototype.hasOwnProperty.call(payload, key)) {
+      return payload[key];
+    }
+
+    const normalized = key.toLowerCase();
+    for (const [candidateKey, candidateValue] of Object.entries(payload)) {
+      if (candidateKey.toLowerCase() === normalized) {
+        return candidateValue;
+      }
+    }
+
+    return undefined;
+  }
+
+  private readPayloadString(payload: Record<string, unknown>, key: string): string | undefined {
+    const value = this.readPayloadValue(payload, key);
+    return typeof value === 'string' ? value : undefined;
+  }
+
+  private readPayloadObject(payload: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+    const value = this.readPayloadValue(payload, key);
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+
+    if (typeof value === 'string') {
+      return this.parseObjectPayload(value);
+    }
+
+    return undefined;
   }
 }
