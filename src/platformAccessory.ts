@@ -70,6 +70,10 @@ export class ToshibaPlatformAccessory {
     this.refreshFromDevice();
   }
 
+  refreshFromPlatform(): void {
+    this.refreshFromDevice();
+  }
+
   dispose(): void {
     this.device.removeListener(this.handleDeviceChanged);
     this.clearRotationSpeedPreference();
@@ -92,37 +96,37 @@ export class ToshibaPlatformAccessory {
     this.heaterCoolerService.setCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature, initialTargetTemperature);
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.Active)
-      .onGet(async () => this.getActiveValue())
+      .onGet(async () => this.readForHomeKit(() => this.getActiveValue()))
       .onSet(async (value) => this.wrapSet(async () => this.setActiveValue(value)));
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.CurrentHeaterCoolerState)
-      .onGet(async () => this.getCurrentHeaterCoolerStateValue());
+      .onGet(async () => this.readForHomeKit(() => this.getCurrentHeaterCoolerStateValue()));
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.TargetHeaterCoolerState)
       .setProps({ validValues: this.supportedTargetHeaterCoolerStateValues() })
-      .onGet(async () => this.getTargetHeaterCoolerStateValue())
+      .onGet(async () => this.readForHomeKit(() => this.getTargetHeaterCoolerStateValue()))
       .onSet(async (value) => this.wrapSet(async () => this.setTargetHeaterCoolerStateValue(value)));
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.CurrentTemperature)
-      .onGet(async () => this.getCurrentTemperatureValue());
+      .onGet(async () => this.readForHomeKit(() => this.getCurrentTemperatureValue()));
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.CoolingThresholdTemperature)
       .setProps({ minValue: MIN_TARGET_TEMPERATURE, maxValue: MAX_TARGET_TEMPERATURE, minStep: 1 })
-      .onGet(async () => this.getTargetTemperatureValue())
+      .onGet(async () => this.readForHomeKit(() => this.getTargetTemperatureValue()))
       .onSet(async (value) => this.wrapSet(async () => this.setTargetTemperatureValue(value)));
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature)
       .setProps({ minValue: MIN_TARGET_TEMPERATURE, maxValue: MAX_TARGET_TEMPERATURE, minStep: 1 })
-      .onGet(async () => this.getTargetTemperatureValue())
+      .onGet(async () => this.readForHomeKit(() => this.getTargetTemperatureValue()))
       .onSet(async (value) => this.wrapSet(async () => this.setTargetTemperatureValue(value)));
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.RotationSpeed)
       .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
-      .onGet(async () => this.getRotationSpeedValue())
+      .onGet(async () => this.readForHomeKit(() => this.getRotationSpeedValue()))
       .onSet(async (value) => this.wrapSet(async () => this.setRotationSpeedValue(value)));
 
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.SwingMode)
-      .onGet(async () => this.getSwingModeValue())
+      .onGet(async () => this.readForHomeKit(() => this.getSwingModeValue()))
       .onSet(async (value) => this.wrapSet(async () => this.setSwingModeValue(value)));
   }
 
@@ -183,9 +187,22 @@ export class ToshibaPlatformAccessory {
   }
 
   private getActiveValue(): number {
-    return this.device.status === ToshibaAcStatus.ON
+    return this.isOperationallyActive()
       ? this.platform.Characteristic.Active.ACTIVE
       : this.platform.Characteristic.Active.INACTIVE;
+  }
+
+  private isOperationallyActive(): boolean {
+    if (this.device.status === ToshibaAcStatus.ON) {
+      return true;
+    }
+
+    if (this.device.status === ToshibaAcStatus.OFF) {
+      return false;
+    }
+
+    // Some cloud updates can transiently omit status while still reporting a concrete mode.
+    return this.device.mode !== ToshibaAcMode.NONE;
   }
 
   private async setActiveValue(value: CharacteristicValue): Promise<void> {
@@ -194,7 +211,7 @@ export class ToshibaPlatformAccessory {
   }
 
   private getCurrentHeaterCoolerStateValue(): number {
-    if (this.device.status !== ToshibaAcStatus.ON) {
+    if (!this.isOperationallyActive()) {
       return this.platform.Characteristic.CurrentHeaterCoolerState.INACTIVE;
     }
 
@@ -301,21 +318,16 @@ export class ToshibaPlatformAccessory {
     const requestedFanMode = this.fanModeFromRotationSpeed(target);
     const requestedMeritA = this.meritAFromRotationSpeed(target);
     const requestedPowerSelection = this.powerSelectionFromRotationSpeed(target);
-    const supportedForMode = this.device.supported.forMode(this.device.mode);
-
-    const fanMode = supportedForMode.acFanMode.includes(requestedFanMode)
-      ? requestedFanMode
-      : this.device.fanMode;
-    const meritA = supportedForMode.acMeritA.includes(requestedMeritA)
-      ? requestedMeritA
-      : ToshibaAcMeritA.OFF;
-    const powerSelection = supportedForMode.acPowerSelection.includes(requestedPowerSelection)
-      ? requestedPowerSelection
-      : this.device.powerSelection;
+    const fanMode = this.resolveSupportedFanMode(requestedFanMode);
+    const meritA = this.resolveSupportedMeritA(requestedMeritA);
+    const powerSelection = this.resolveSupportedPowerSelection(requestedPowerSelection);
 
     this.rememberRotationSpeedPreference(target, fanMode, meritA, powerSelection);
 
     const updates: Array<Promise<void>> = [];
+    if (target > ROTATION_SPEED_AUTO && this.device.status !== ToshibaAcStatus.ON) {
+      updates.push(this.device.setStatus(ToshibaAcStatus.ON));
+    }
     if (this.device.fanMode !== fanMode) {
       updates.push(this.device.setFanMode(fanMode));
     }
@@ -476,6 +488,97 @@ export class ToshibaPlatformAccessory {
     return ToshibaAcPowerSelection.POWER_100;
   }
 
+  private resolveSupportedFanMode(requested: ToshibaAcFanMode): ToshibaAcFanMode {
+    const supported: ToshibaAcFanMode[] = this.device.supported.acFanMode
+      .filter(value => value !== ToshibaAcFanMode.NONE);
+    if (supported.includes(requested)) {
+      return requested;
+    }
+
+    if (supported.includes(this.device.fanMode)) {
+      return this.device.fanMode;
+    }
+
+    return supported[0] ?? ToshibaAcFanMode.AUTO;
+  }
+
+  private resolveSupportedMeritA(requested: ToshibaAcMeritA): ToshibaAcMeritA {
+    const supported: ToshibaAcMeritA[] = this.device.supported.acMeritA
+      .filter(value => value !== ToshibaAcMeritA.NONE);
+    if (supported.includes(requested)) {
+      return requested;
+    }
+
+    if (
+      requested === ToshibaAcMeritA.CDU_SILENT_1 ||
+      requested === ToshibaAcMeritA.CDU_SILENT_2
+    ) {
+      if (
+        (this.device.meritA === ToshibaAcMeritA.CDU_SILENT_1 || this.device.meritA === ToshibaAcMeritA.CDU_SILENT_2) &&
+        supported.includes(this.device.meritA)
+      ) {
+        return this.device.meritA;
+      }
+      if (supported.includes(ToshibaAcMeritA.CDU_SILENT_1)) {
+        return ToshibaAcMeritA.CDU_SILENT_1;
+      }
+      if (supported.includes(ToshibaAcMeritA.CDU_SILENT_2)) {
+        return ToshibaAcMeritA.CDU_SILENT_2;
+      }
+    }
+
+    if (supported.includes(ToshibaAcMeritA.OFF)) {
+      return ToshibaAcMeritA.OFF;
+    }
+
+    if (supported.includes(this.device.meritA)) {
+      return this.device.meritA;
+    }
+
+    return supported[0] ?? ToshibaAcMeritA.OFF;
+  }
+
+  private resolveSupportedPowerSelection(requested: ToshibaAcPowerSelection): ToshibaAcPowerSelection {
+    const supported: ToshibaAcPowerSelection[] = this.device.supported.acPowerSelection
+      .filter(value => value !== ToshibaAcPowerSelection.NONE);
+    if (supported.includes(requested)) {
+      return requested;
+    }
+
+    if (supported.length > 0) {
+      const requestedValue = this.powerSelectionNumericValue(requested);
+      if (typeof requestedValue === 'number') {
+        const nearest = supported.reduce((best, candidate) => {
+          const bestValue = this.powerSelectionNumericValue(best) ?? Number.POSITIVE_INFINITY;
+          const candidateValue = this.powerSelectionNumericValue(candidate) ?? Number.POSITIVE_INFINITY;
+          const bestDistance = Math.abs(bestValue - requestedValue);
+          const candidateDistance = Math.abs(candidateValue - requestedValue);
+          return candidateDistance < bestDistance ? candidate : best;
+        }, supported[0]);
+        return nearest;
+      }
+    }
+
+    if (supported.includes(this.device.powerSelection)) {
+      return this.device.powerSelection;
+    }
+
+    return supported[0] ?? ToshibaAcPowerSelection.POWER_75;
+  }
+
+  private powerSelectionNumericValue(value: ToshibaAcPowerSelection): number | undefined {
+    switch (value) {
+    case ToshibaAcPowerSelection.POWER_50:
+      return 50;
+    case ToshibaAcPowerSelection.POWER_75:
+      return 75;
+    case ToshibaAcPowerSelection.POWER_100:
+      return 100;
+    default:
+      return undefined;
+    }
+  }
+
   private supportedTargetHeaterCoolerStateValues(): number[] {
     const values: number[] = [];
 
@@ -620,11 +723,31 @@ export class ToshibaPlatformAccessory {
 
   private async wrapSet(setter: () => Promise<void>): Promise<void> {
     try {
+      if (this.isDeviceCloudOffline()) {
+        throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      }
+
       await setter();
     } catch (error) {
+      if (error instanceof this.platform.api.hap.HapStatusError) {
+        throw error;
+      }
+
       this.platform.log.error(`[ACCESSORY] ${this.device.name}: ${this.errorToString(error)}`);
       throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
+  }
+
+  private readForHomeKit<T extends CharacteristicValue>(read: () => T): T {
+    if (this.isDeviceCloudOffline()) {
+      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+
+    return read();
+  }
+
+  private isDeviceCloudOffline(): boolean {
+    return this.platform.getDeviceCloudConnectionState(this.device.uniqueId) === 'offline';
   }
 
   private errorToString(error: unknown): string {

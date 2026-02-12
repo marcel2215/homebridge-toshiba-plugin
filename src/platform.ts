@@ -42,6 +42,8 @@ const MOBILE_DEVICE_ID_STORAGE_DIR = 'toshiba-smart-ac';
 const MOBILE_DEVICE_ID_STORAGE_FILE = 'mobile-device-id.txt';
 const STARTUP_RETRY_MAX_DELAY_MS = 5 * 60 * 1000;
 const DEVICE_CONNECTION_STATE_CACHE_TTL_MS = 5_000;
+const MISSING_DEVICE_CONNECTION_STATE = 'MissingFromResponse';
+const MALFORMED_DEVICE_CONNECTION_STATE = 'MalformedConnectionState';
 const STATE_ENDPOINT_BOTH_FORBIDDEN_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const STATE_ENDPOINT_FORBIDDEN_PROBE_INTERVAL_MS = 15 * 60 * 1000;
 const MIN_POLL_INTERVAL_SECONDS = 30;
@@ -54,6 +56,7 @@ const MIN_HTTP_RETRIES = 0;
 const MAX_HTTP_RETRIES = 10;
 
 type ToshibaStateEndpoint = 'unique' | 'acid';
+type ToshibaCloudConnectionState = 'online' | 'offline' | 'unknown';
 
 interface ToshibaStateEndpointStatus {
   preferred: ToshibaStateEndpoint;
@@ -120,6 +123,20 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   configureAccessory(accessory: PlatformAccessory): void {
     this.log.info('Loading accessory from cache:', accessory.displayName);
     this.accessories.set(accessory.UUID, accessory);
+  }
+
+  public getDeviceCloudConnectionState(uniqueId: string): ToshibaCloudConnectionState {
+    const normalizedUniqueId = this.normalizeCloudIdentifier(uniqueId);
+    if (!normalizedUniqueId) {
+      return 'unknown';
+    }
+
+    const cached = this.connectionStateCache.get(normalizedUniqueId) ?? this.connectionStateCache.get(uniqueId);
+    if (!cached) {
+      return 'unknown';
+    }
+
+    return this.isConnectedState(cached.state) ? 'online' : 'offline';
   }
 
   private async start(): Promise<void> {
@@ -415,6 +432,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     }
     const discoveredAccessoryUuids = new Set<string>();
     const discoveredUniqueIds = new Set<string>();
+    const discoveredConnectionStateUniqueIds = new Set<string>();
 
     for (const discovered of discoveredDevices) {
       const uniqueIdKey = this.normalizeCloudIdentifier(discovered.uniqueId);
@@ -428,6 +446,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         continue;
       }
       discoveredUniqueIds.add(uniqueIdKey);
+      discoveredConnectionStateUniqueIds.add(discovered.uniqueId);
 
       try {
         let device = this.devicesByUniqueId.get(uniqueIdKey);
@@ -527,6 +546,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       }
     }
 
+    await this.refreshDeviceConnectionStates([...discoveredConnectionStateUniqueIds]);
     this.removeStaleAccessories(discoveredAccessoryUuids);
   }
 
@@ -643,7 +663,14 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     }
 
     await this.queueOperation(async () => {
+      await this.refreshDeviceConnectionStates([...this.devicesByUniqueId.values()].map(device => device.uniqueId));
+
       for (const device of this.devicesByUniqueId.values()) {
+        if (this.getDeviceCloudConnectionState(device.uniqueId) === 'offline') {
+          this.log.debug(`[PLATFORM] Skipping state refresh for ${device.name}: device reported offline`);
+          continue;
+        }
+
         try {
           const latestState = await this.fetchLatestStateForDevice(device);
           if (!latestState) {
@@ -859,7 +886,8 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    const cachedState = this.connectionStateCache.get(uniqueId);
+    const normalizedUniqueId = this.normalizeCloudIdentifier(uniqueId);
+    const cachedState = this.connectionStateCache.get(normalizedUniqueId) ?? this.connectionStateCache.get(uniqueId);
     if (cachedState && (Date.now() - cachedState.updatedAt) <= DEVICE_CONNECTION_STATE_CACHE_TTL_MS) {
       if (this.isConnectedState(cachedState.state)) {
         return;
@@ -899,27 +927,23 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         return;
       }
     }
-    const normalizedUniqueId = this.normalizeCloudIdentifier(uniqueId);
     const state = states.find(item => (
       typeof item.DeviceId === 'string' &&
       this.normalizeCloudIdentifier(item.DeviceId) === normalizedUniqueId
     ));
 
     if (!state) {
-      this.log.warn(`[PLATFORM] Device connection state missing for ${deviceName}; allowing command`);
-      return;
+      this.updateConnectionStateCache(normalizedUniqueId, MISSING_DEVICE_CONNECTION_STATE);
+      throw new Error(`[${deviceName}] Toshiba cloud did not return device connection state`);
     }
 
     const connectionState = typeof state.ConnectionState === 'string' ? state.ConnectionState.trim() : '';
     if (!connectionState) {
-      this.log.warn(`[PLATFORM] Device connection state malformed for ${deviceName}; allowing command`);
-      return;
+      this.updateConnectionStateCache(normalizedUniqueId, MALFORMED_DEVICE_CONNECTION_STATE);
+      throw new Error(`[${deviceName}] Toshiba cloud returned malformed device connection state`);
     }
 
-    this.connectionStateCache.set(uniqueId, {
-      state: connectionState,
-      updatedAt: Date.now(),
-    });
+    this.updateConnectionStateCache(normalizedUniqueId, connectionState);
 
     if (this.isConnectedState(connectionState)) {
       return;
@@ -1035,6 +1059,102 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   private isConnectedState(state: string): boolean {
     const normalized = state.trim().toLowerCase();
     return normalized === 'connected' || normalized === 'online';
+  }
+
+  private async refreshDeviceConnectionStates(uniqueIds: string[]): Promise<void> {
+    if (!this.httpApi || uniqueIds.length === 0 || this.isShuttingDown) {
+      return;
+    }
+
+    const requestUniqueIds: string[] = [];
+    const normalizedUniqueIds: string[] = [];
+    const seenUniqueIds = new Set<string>();
+    for (const uniqueId of uniqueIds) {
+      const normalizedUniqueId = this.normalizeCloudIdentifier(uniqueId);
+      if (!normalizedUniqueId || seenUniqueIds.has(normalizedUniqueId)) {
+        continue;
+      }
+
+      seenUniqueIds.add(normalizedUniqueId);
+      requestUniqueIds.push(uniqueId.trim());
+      normalizedUniqueIds.push(normalizedUniqueId);
+    }
+
+    if (normalizedUniqueIds.length === 0) {
+      return;
+    }
+
+    let states: ToshibaDeviceConnectionState[];
+    try {
+      states = await this.httpApi.getDeviceConnectionStates(requestUniqueIds);
+    } catch (error) {
+      if (error instanceof ToshibaAuthError) {
+        this.log.warn('[PLATFORM] Auth expired while refreshing connection states; reconnecting cloud session');
+        try {
+          await this.connectCloud();
+          if (!this.httpApi || this.isShuttingDown) {
+            return;
+          }
+          states = await this.httpApi.getDeviceConnectionStates(requestUniqueIds);
+        } catch (retryError) {
+          this.log.warn(`[PLATFORM] Failed to refresh connection states after reconnect: ${this.errorToString(retryError)}`);
+          return;
+        }
+      } else {
+        this.log.warn(`[PLATFORM] Failed to refresh connection states: ${this.errorToString(error)}`);
+        return;
+      }
+    }
+
+    const connectionStateByDeviceId = new Map<string, string>();
+    for (const state of states) {
+      const uniqueIdKey = typeof state.DeviceId === 'string' ? this.normalizeCloudIdentifier(state.DeviceId) : '';
+      const connectionState = typeof state.ConnectionState === 'string' ? state.ConnectionState.trim() : '';
+      if (!uniqueIdKey || !connectionState) {
+        continue;
+      }
+
+      connectionStateByDeviceId.set(uniqueIdKey, connectionState);
+    }
+
+    for (const uniqueId of normalizedUniqueIds) {
+      const connectionState = connectionStateByDeviceId.get(uniqueId);
+      if (!connectionState) {
+        this.updateConnectionStateCache(uniqueId, MISSING_DEVICE_CONNECTION_STATE);
+        continue;
+      }
+
+      this.updateConnectionStateCache(uniqueId, connectionState);
+    }
+  }
+
+  private updateConnectionStateCache(uniqueId: string, connectionState: string): void {
+    const uniqueIdKey = this.normalizeCloudIdentifier(uniqueId);
+    if (!uniqueIdKey) {
+      return;
+    }
+
+    const previous = this.connectionStateCache.get(uniqueIdKey);
+    const normalizedConnectionState = connectionState.trim();
+    this.connectionStateCache.set(uniqueIdKey, {
+      state: normalizedConnectionState,
+      updatedAt: Date.now(),
+    });
+
+    if (previous?.state === normalizedConnectionState) {
+      return;
+    }
+
+    const device = this.devicesByUniqueId.get(uniqueIdKey);
+    const deviceName = device?.name ?? uniqueIdKey;
+    if (this.isConnectedState(normalizedConnectionState)) {
+      this.log.info(`[PLATFORM] ${deviceName}: cloud connection restored (${normalizedConnectionState})`);
+    } else {
+      this.log.info(`[PLATFORM] ${deviceName}: cloud reports device offline (${normalizedConnectionState})`);
+    }
+
+    const accessoryUuid = this.api.hap.uuid.generate(`toshiba-smart-ac:${uniqueIdKey}`);
+    this.accessoryHandlers.get(accessoryUuid)?.refreshFromPlatform();
   }
 
   private findDeviceByCloudSourceId(sourceId: string): ToshibaAcDevice | undefined {
