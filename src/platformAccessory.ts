@@ -488,7 +488,7 @@ export class ToshibaPlatformAccessory {
     // Toshiba MeritA is a single-choice field, so we cannot represent ECO and outdoor silent simultaneously.
     // For the lowest speed band we prioritize outdoor silent behavior.
     if (speed > ROTATION_SPEED_AUTO && speed <= ROTATION_SPEED_INDOOR_AND_OUTDOOR_SILENT_MAX) {
-      return ToshibaAcMeritA.CDU_SILENT_1;
+      return this.preferredOutdoorSilentMeritA();
     }
 
     if (speed > ROTATION_SPEED_AUTO && speed <= ROTATION_SPEED_ECO_MAX) {
@@ -496,6 +496,18 @@ export class ToshibaPlatformAccessory {
     }
 
     return ToshibaAcMeritA.OFF;
+  }
+
+  private preferredOutdoorSilentMeritA(): ToshibaAcMeritA {
+    if (
+      this.device.meritA === ToshibaAcMeritA.CDU_SILENT_1 ||
+      this.device.meritA === ToshibaAcMeritA.CDU_SILENT_2
+    ) {
+      return this.device.meritA;
+    }
+
+    // Most current Toshiba models expose silent level 2 as the effective outdoor-silent flag.
+    return ToshibaAcMeritA.CDU_SILENT_2;
   }
 
   private powerSelectionFromRotationSpeed(speed: number): ToshibaAcPowerSelection {
