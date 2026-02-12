@@ -342,6 +342,9 @@ export class ToshibaPlatformAccessory {
     const fanMode = this.resolveSupportedFanMode(requestedFanMode);
     const meritA = this.resolveSupportedMeritA(requestedMeritA);
     const powerSelection = this.resolveSupportedPowerSelection(requestedPowerSelection);
+    this.platform.log.debug(
+      `[ACCESSORY] ${this.device.name}: rotation ${target}% -> fan=${fanMode}, meritA=${meritA}, powerSelection=${powerSelection}`,
+    );
 
     this.rememberRotationSpeedPreference(target, fanMode, meritA, powerSelection);
 
@@ -542,11 +545,11 @@ export class ToshibaPlatformAccessory {
       ) {
         return this.device.meritA;
       }
-      if (supported.includes(ToshibaAcMeritA.CDU_SILENT_1)) {
-        return ToshibaAcMeritA.CDU_SILENT_1;
-      }
       if (supported.includes(ToshibaAcMeritA.CDU_SILENT_2)) {
         return ToshibaAcMeritA.CDU_SILENT_2;
+      }
+      if (supported.includes(ToshibaAcMeritA.CDU_SILENT_1)) {
+        return ToshibaAcMeritA.CDU_SILENT_1;
       }
     }
 
