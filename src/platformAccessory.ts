@@ -14,11 +14,10 @@ import {
 const MIN_TARGET_TEMPERATURE = 5;
 const MAX_TARGET_TEMPERATURE = 35;
 const ROTATION_SPEED_AUTO = 0;
-const ROTATION_SPEED_OUTDOOR_SILENT_MAX = 5;
-const ROTATION_SPEED_INDOOR_SILENT_MAX = 10;
-const ROTATION_SPEED_ECO_MAX = 20;
+const ROTATION_SPEED_INDOOR_AND_OUTDOOR_SILENT_MAX = 10;
+const ROTATION_SPEED_INDOOR_SILENT_MAX = 20;
+const ROTATION_SPEED_ECO_MAX = 30;
 const ROTATION_SPEED_HIGH_POWER = 100;
-const ROTATION_SPEED_PREFERENCE_MAX_AGE_MS = 15 * 60 * 1000;
 
 const FAN_SPEED_MAP: Array<[ToshibaAcFanMode, number]> = [
   [ToshibaAcFanMode.AUTO, 0],
@@ -55,6 +54,7 @@ export class ToshibaPlatformAccessory {
     this.removeLegacyAuxiliaryServices();
     this.configureAccessoryInformation();
     this.configureHeaterCoolerService();
+    this.loadRotationSpeedPreferenceFromContext();
 
     this.refreshFromDevice();
   }
@@ -63,7 +63,7 @@ export class ToshibaPlatformAccessory {
     this.device.removeListener(this.handleDeviceChanged);
     this.device = device;
     this.device.addListener(this.handleDeviceChanged);
-    this.clearRotationSpeedPreference();
+    this.loadRotationSpeedPreferenceFromContext();
 
     this.configureAccessoryInformation();
     this.removeLegacyAuxiliaryServices();
@@ -139,6 +139,11 @@ export class ToshibaPlatformAccessory {
     this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.TargetHeaterCoolerState)
       .setProps({ validValues: this.supportedTargetHeaterCoolerStateValues() });
 
+    if (this.isDeviceCloudOffline()) {
+      this.publishUnavailableCharacteristics();
+      return;
+    }
+
     this.heaterCoolerService.updateCharacteristic(this.platform.Characteristic.Active, this.getActiveValue());
     this.heaterCoolerService.updateCharacteristic(this.platform.Characteristic.CurrentHeaterCoolerState, this.getCurrentHeaterCoolerStateValue());
     this.heaterCoolerService.updateCharacteristic(this.platform.Characteristic.TargetHeaterCoolerState, this.getTargetHeaterCoolerStateValue());
@@ -149,6 +154,19 @@ export class ToshibaPlatformAccessory {
     this.heaterCoolerService.updateCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature, targetTemperature);
     this.heaterCoolerService.updateCharacteristic(this.platform.Characteristic.RotationSpeed, this.getRotationSpeedValue());
     this.heaterCoolerService.updateCharacteristic(this.platform.Characteristic.SwingMode, this.getSwingModeValue());
+  }
+
+  private publishUnavailableCharacteristics(): void {
+    const unavailable = new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.Active).updateValue(unavailable);
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.CurrentHeaterCoolerState).updateValue(unavailable);
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.TargetHeaterCoolerState).updateValue(unavailable);
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.CurrentTemperature).updateValue(unavailable);
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.CoolingThresholdTemperature).updateValue(unavailable);
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature).updateValue(unavailable);
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.RotationSpeed).updateValue(unavailable);
+    this.heaterCoolerService.getCharacteristic(this.platform.Characteristic.SwingMode).updateValue(unavailable);
   }
 
   private refreshServiceNames(): void {
@@ -293,15 +311,18 @@ export class ToshibaPlatformAccessory {
     }
 
     if (this.device.meritA === ToshibaAcMeritA.CDU_SILENT_1 || this.device.meritA === ToshibaAcMeritA.CDU_SILENT_2) {
-      return ROTATION_SPEED_OUTDOOR_SILENT_MAX;
+      return ROTATION_SPEED_INDOOR_AND_OUTDOOR_SILENT_MAX;
+    }
+
+    if (this.device.meritA === ToshibaAcMeritA.ECO) {
+      if (this.device.fanMode === ToshibaAcFanMode.QUIET) {
+        return ROTATION_SPEED_INDOOR_SILENT_MAX;
+      }
+      return ROTATION_SPEED_ECO_MAX;
     }
 
     if (this.device.fanMode === ToshibaAcFanMode.QUIET) {
       return ROTATION_SPEED_INDOOR_SILENT_MAX;
-    }
-
-    if (this.device.meritA === ToshibaAcMeritA.ECO) {
-      return ROTATION_SPEED_ECO_MAX;
     }
 
     for (const [fanMode, speed] of FAN_SPEED_MAP) {
@@ -461,7 +482,9 @@ export class ToshibaPlatformAccessory {
       return ToshibaAcMeritA.HIGH_POWER;
     }
 
-    if (speed > ROTATION_SPEED_AUTO && speed <= ROTATION_SPEED_OUTDOOR_SILENT_MAX) {
+    // Toshiba MeritA is a single-choice field, so we cannot represent ECO and outdoor silent simultaneously.
+    // For the lowest speed band we prioritize outdoor silent behavior.
+    if (speed > ROTATION_SPEED_AUTO && speed <= ROTATION_SPEED_INDOOR_AND_OUTDOOR_SILENT_MAX) {
       return ToshibaAcMeritA.CDU_SILENT_1;
     }
 
@@ -659,11 +682,6 @@ export class ToshibaPlatformAccessory {
     }
 
     // Keep the user-selected slider value stable while Toshiba cloud state still maps to the same tuple.
-    if ((Date.now() - preference.updatedAt) > ROTATION_SPEED_PREFERENCE_MAX_AGE_MS) {
-      this.clearRotationSpeedPreference();
-      return undefined;
-    }
-
     if (!this.isRotationSpeedPreferenceApplicable(preference)) {
       this.clearRotationSpeedPreference();
       return undefined;
@@ -715,10 +733,58 @@ export class ToshibaPlatformAccessory {
       powerSelection,
       updatedAt: Date.now(),
     };
+    this.accessory.context.rotationSpeedPreference = {
+      speed,
+      fanMode,
+      meritA,
+      powerSelection,
+    };
   }
 
   private clearRotationSpeedPreference(): void {
     this.rotationSpeedPreference = undefined;
+    delete this.accessory.context.rotationSpeedPreference;
+  }
+
+  private loadRotationSpeedPreferenceFromContext(): void {
+    const stored = this.accessory.context.rotationSpeedPreference;
+    if (typeof stored !== 'object' || stored === null) {
+      this.rotationSpeedPreference = undefined;
+      return;
+    }
+
+    const raw = stored as {
+      speed?: unknown;
+      fanMode?: unknown;
+      meritA?: unknown;
+      powerSelection?: unknown;
+    };
+
+    const speed = Number(raw.speed);
+    const fanMode = typeof raw.fanMode === 'string' ? raw.fanMode as ToshibaAcFanMode : undefined;
+    const meritA = typeof raw.meritA === 'string' ? raw.meritA as ToshibaAcMeritA : undefined;
+    const powerSelection = typeof raw.powerSelection === 'string' ? raw.powerSelection as ToshibaAcPowerSelection : undefined;
+
+    if (
+      !Number.isFinite(speed) ||
+      !fanMode ||
+      !Object.values(ToshibaAcFanMode).includes(fanMode) ||
+      !meritA ||
+      !Object.values(ToshibaAcMeritA).includes(meritA) ||
+      !powerSelection ||
+      !Object.values(ToshibaAcPowerSelection).includes(powerSelection)
+    ) {
+      this.clearRotationSpeedPreference();
+      return;
+    }
+
+    this.rotationSpeedPreference = {
+      speed: this.normalizeRotationSpeed(speed),
+      fanMode,
+      meritA,
+      powerSelection,
+      updatedAt: Date.now(),
+    };
   }
 
   private async wrapSet(setter: () => Promise<void>): Promise<void> {

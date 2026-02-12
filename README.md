@@ -42,22 +42,46 @@ Homebridge dynamic platform plugin for Toshiba **Home AC Control** cloud devices
 
 The plugin keeps a single HomeKit `HeaterCooler` tile and maps Toshiba-specific behavior from `RotationSpeed`:
 
-- `0%` => fan `AUTO`
-- `> 0% && <= 5%` => outdoor silent (`CDU_SILENT_1`) ON
-- `> 0% && <= 10%` => indoor silent (`QUIET` fan) ON
-- `> 0% && <= 20%` => eco (`ECO`) ON
-- `100%` => high power (`HIGH_POWER`) ON
+- `0%`:
+  - fan `AUTO`
+  - eco OFF
+  - high power OFF
+  - indoor silent OFF
+  - outdoor silent OFF
+- `> 0% && <= 10%`:
+  - indoor silent ON (`QUIET` fan)
+  - outdoor silent ON (`CDU_SILENT_1/2`)
+  - eco requested by profile, but Toshiba `MeritA` is single-choice so this band prioritizes outdoor silent
+- `> 10% && <= 20%`:
+  - indoor silent ON (`QUIET` fan)
+  - eco ON (`ECO`)
+  - outdoor silent OFF
+- `> 20% && <= 30%`:
+  - indoor silent OFF
+  - eco ON (`ECO`)
+  - outdoor silent OFF
+- `> 30% && < 100%`:
+  - eco OFF
+  - high power OFF
+  - indoor silent OFF
+  - outdoor silent OFF
+- `100%`:
+  - high power ON (`HIGH_POWER`)
+  - eco OFF
+  - indoor silent OFF
+  - outdoor silent OFF
 - Power selection is derived from `RotationSpeed`:
   - `0%` => middle (`POWER_75`)
   - `1..33%` => `POWER_50`
   - `34..66%` => `POWER_75`
   - `67..100%` => `POWER_100`
+- Fan mode selection for non-silent speeds uses nearest discrete Toshiba step by absolute difference.
 - Rotation slider stability:
-  - Plugin keeps your last explicit slider value when cloud state still matches the same mapped Toshiba tuple.
+  - Plugin keeps your last explicit Home app slider percentage while cloud state still matches the same mapped Toshiba tuple.
   - This prevents Home app “jumping” to quantized fan buckets after a successful set.
 
 Note: Toshiba `Merit A` is a single field in cloud payload, so overlapping low-speed modes use precedence:
-`HIGH_POWER` > `CDU_SILENT_1` > `ECO` > `OFF`.
+`HIGH_POWER` > `CDU_SILENT_1/2` > `ECO` > `OFF`.
 
 ## Install
 

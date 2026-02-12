@@ -44,6 +44,7 @@ const STARTUP_RETRY_MAX_DELAY_MS = 5 * 60 * 1000;
 const DEVICE_CONNECTION_STATE_CACHE_TTL_MS = 5_000;
 const MISSING_DEVICE_CONNECTION_STATE = 'MissingFromResponse';
 const MALFORMED_DEVICE_CONNECTION_STATE = 'MalformedConnectionState';
+const MISSING_CONNECTION_STATE_OFFLINE_THRESHOLD = 2;
 const STATE_ENDPOINT_BOTH_FORBIDDEN_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const STATE_ENDPOINT_FORBIDDEN_PROBE_INTERVAL_MS = 15 * 60 * 1000;
 const MIN_POLL_INTERVAL_SECONDS = 30;
@@ -75,6 +76,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
   private readonly accessoryHandlers = new Map<string, ToshibaPlatformAccessory>();
   private readonly devicesByUniqueId = new Map<string, ToshibaAcDevice>();
   private readonly connectionStateCache = new Map<string, { state: string; updatedAt: number }>();
+  private readonly missingConnectionStateCounts = new Map<string, number>();
   private readonly stateEndpointByDevice = new Map<string, ToshibaStateEndpointStatus>();
 
   private readonly sessionId: string;
@@ -245,7 +247,6 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    this.connectionStateCache.clear();
     this.stateEndpointByDevice.clear();
     this.additionalInfoEndpointForbidden = false;
 
@@ -558,12 +559,20 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
       this.log.info('Removing stale accessory from cache:', accessory.displayName);
 
+      try {
+        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      } catch (error) {
+        this.log.error(
+          `[PLATFORM] Failed to unregister stale accessory ${accessory.displayName}: ${this.errorToString(error)}`,
+        );
+        continue;
+      }
+
       const handler = this.accessoryHandlers.get(uuid);
       if (handler) {
         handler.dispose?.();
       }
 
-      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       this.accessories.delete(uuid);
       this.accessoryHandlers.delete(uuid);
 
@@ -575,11 +584,14 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
         this.devicesByUniqueId.delete(uniqueIdKey);
         if (device) {
           this.connectionStateCache.delete(device.uniqueId);
+          this.missingConnectionStateCounts.delete(device.uniqueId);
           this.stateEndpointByDevice.delete(device.uniqueId);
         }
         this.connectionStateCache.delete(uniqueIdKey);
+        this.missingConnectionStateCounts.delete(uniqueIdKey);
         this.stateEndpointByDevice.delete(uniqueIdKey);
         this.connectionStateCache.delete(uniqueId);
+        this.missingConnectionStateCounts.delete(uniqueId);
         this.stateEndpointByDevice.delete(uniqueId);
       }
     }
@@ -839,6 +851,8 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       return;
     }
 
+    this.updateConnectionStateCache(device.uniqueId, 'Connected');
+
     const state = payload.data;
     if (typeof state !== 'string') {
       this.log.warn(`[AMQP API] Received malformed state update for ${device.name}`);
@@ -858,6 +872,8 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
       this.log.debug(`[AMQP API] Ignoring heartbeat for unknown device: ${sourceId}`);
       return;
     }
+
+    this.updateConnectionStateCache(device.uniqueId, 'Connected');
 
     try {
       device.applyHeartbeat(payload);
@@ -887,6 +903,10 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     }
 
     const normalizedUniqueId = this.normalizeCloudIdentifier(uniqueId);
+    if (!normalizedUniqueId) {
+      throw new Error(`[${deviceName}] Missing or malformed device unique id`);
+    }
+
     const cachedState = this.connectionStateCache.get(normalizedUniqueId) ?? this.connectionStateCache.get(uniqueId);
     if (cachedState && (Date.now() - cachedState.updatedAt) <= DEVICE_CONNECTION_STATE_CACHE_TTL_MS) {
       if (this.isConnectedState(cachedState.state)) {
@@ -933,16 +953,45 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     ));
 
     if (!state) {
-      this.updateConnectionStateCache(normalizedUniqueId, MISSING_DEVICE_CONNECTION_STATE);
-      throw new Error(`[${deviceName}] Toshiba cloud did not return device connection state`);
+      const missingCount = this.incrementMissingConnectionStateCount(normalizedUniqueId);
+      if (cachedState && !this.isConnectedState(cachedState.state)) {
+        this.updateConnectionStateCache(normalizedUniqueId, MISSING_DEVICE_CONNECTION_STATE);
+        throw new Error(`[${deviceName}] Toshiba cloud did not return device connection state`);
+      }
+
+      if (missingCount >= MISSING_CONNECTION_STATE_OFFLINE_THRESHOLD) {
+        this.updateConnectionStateCache(normalizedUniqueId, MISSING_DEVICE_CONNECTION_STATE);
+        throw new Error(`[${deviceName}] Toshiba cloud did not return device connection state`);
+      }
+
+      this.log.warn(
+        `[PLATFORM] Device connection state missing for ${deviceName}; allowing command ` +
+        `(missing count ${missingCount}/${MISSING_CONNECTION_STATE_OFFLINE_THRESHOLD})`,
+      );
+      return;
     }
 
     const connectionState = typeof state.ConnectionState === 'string' ? state.ConnectionState.trim() : '';
     if (!connectionState) {
-      this.updateConnectionStateCache(normalizedUniqueId, MALFORMED_DEVICE_CONNECTION_STATE);
-      throw new Error(`[${deviceName}] Toshiba cloud returned malformed device connection state`);
+      const missingCount = this.incrementMissingConnectionStateCount(normalizedUniqueId);
+      if (cachedState && !this.isConnectedState(cachedState.state)) {
+        this.updateConnectionStateCache(normalizedUniqueId, MALFORMED_DEVICE_CONNECTION_STATE);
+        throw new Error(`[${deviceName}] Toshiba cloud returned malformed device connection state`);
+      }
+
+      if (missingCount >= MISSING_CONNECTION_STATE_OFFLINE_THRESHOLD) {
+        this.updateConnectionStateCache(normalizedUniqueId, MALFORMED_DEVICE_CONNECTION_STATE);
+        throw new Error(`[${deviceName}] Toshiba cloud returned malformed device connection state`);
+      }
+
+      this.log.warn(
+        `[PLATFORM] Device connection state malformed for ${deviceName}; allowing command ` +
+        `(missing count ${missingCount}/${MISSING_CONNECTION_STATE_OFFLINE_THRESHOLD})`,
+      );
+      return;
     }
 
+    this.clearMissingConnectionStateCount(normalizedUniqueId);
     this.updateConnectionStateCache(normalizedUniqueId, connectionState);
 
     if (this.isConnectedState(connectionState)) {
@@ -990,6 +1039,7 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     }
     this.devicesByUniqueId.clear();
     this.connectionStateCache.clear();
+    this.missingConnectionStateCounts.clear();
     this.stateEndpointByDevice.clear();
 
     if (this.amqpClient) {
@@ -1120,10 +1170,20 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
     for (const uniqueId of normalizedUniqueIds) {
       const connectionState = connectionStateByDeviceId.get(uniqueId);
       if (!connectionState) {
+        const missingCount = this.incrementMissingConnectionStateCount(uniqueId);
+        if (missingCount < MISSING_CONNECTION_STATE_OFFLINE_THRESHOLD) {
+          this.log.debug(
+            `[PLATFORM] Connection state missing for ${uniqueId}; keeping previous state ` +
+            `(missing count ${missingCount}/${MISSING_CONNECTION_STATE_OFFLINE_THRESHOLD})`,
+          );
+          continue;
+        }
+
         this.updateConnectionStateCache(uniqueId, MISSING_DEVICE_CONNECTION_STATE);
         continue;
       }
 
+      this.clearMissingConnectionStateCount(uniqueId);
       this.updateConnectionStateCache(uniqueId, connectionState);
     }
   }
@@ -1136,6 +1196,19 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
     const previous = this.connectionStateCache.get(uniqueIdKey);
     const normalizedConnectionState = connectionState.trim();
+    if (!normalizedConnectionState) {
+      this.log.debug(`[PLATFORM] Ignoring empty connection state update for ${uniqueIdKey}`);
+      return;
+    }
+
+    if (
+      normalizedConnectionState &&
+      normalizedConnectionState !== MISSING_DEVICE_CONNECTION_STATE &&
+      normalizedConnectionState !== MALFORMED_DEVICE_CONNECTION_STATE
+    ) {
+      this.clearMissingConnectionStateCount(uniqueIdKey);
+    }
+
     this.connectionStateCache.set(uniqueIdKey, {
       state: normalizedConnectionState,
       updatedAt: Date.now(),
@@ -1155,6 +1228,27 @@ export class ToshibaSmartACPlatform implements DynamicPlatformPlugin {
 
     const accessoryUuid = this.api.hap.uuid.generate(`toshiba-smart-ac:${uniqueIdKey}`);
     this.accessoryHandlers.get(accessoryUuid)?.refreshFromPlatform();
+  }
+
+  private incrementMissingConnectionStateCount(uniqueId: string): number {
+    const uniqueIdKey = this.normalizeCloudIdentifier(uniqueId);
+    if (!uniqueIdKey) {
+      return 0;
+    }
+
+    const current = this.missingConnectionStateCounts.get(uniqueIdKey) ?? 0;
+    const next = current + 1;
+    this.missingConnectionStateCounts.set(uniqueIdKey, next);
+    return next;
+  }
+
+  private clearMissingConnectionStateCount(uniqueId: string): void {
+    const uniqueIdKey = this.normalizeCloudIdentifier(uniqueId);
+    if (!uniqueIdKey) {
+      return;
+    }
+
+    this.missingConnectionStateCounts.delete(uniqueIdKey);
   }
 
   private findDeviceByCloudSourceId(sourceId: string): ToshibaAcDevice | undefined {

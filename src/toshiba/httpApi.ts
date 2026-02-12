@@ -57,6 +57,7 @@ export class ToshibaHttpApi {
   private accessToken = '';
   private tokenType = 'Bearer';
   private consumerId = '';
+  private additionalInfoByUniqueIdUnavailable = false;
 
   private readonly timeoutMs: number;
   private readonly retries: number;
@@ -95,6 +96,8 @@ export class ToshibaHttpApi {
     this.accessToken = token.access_token;
     this.tokenType = token.token_type || 'Bearer';
     this.consumerId = token.consumerId;
+    // Endpoint availability can vary across sessions; re-probe after successful auth.
+    this.additionalInfoByUniqueIdUnavailable = false;
   }
 
   async getDevices(): Promise<ToshibaDiscoveredDevice[]> {
@@ -132,31 +135,40 @@ export class ToshibaHttpApi {
         }
 
         const ac = acRaw as ToshibaAcMappingGroup['ACList'][number];
-        const hasRequiredFields = (
-          typeof ac.Id === 'string' && ac.Id.length > 0 &&
-          typeof ac.DeviceUniqueId === 'string' && ac.DeviceUniqueId.length > 0 &&
-          typeof ac.Name === 'string' && ac.Name.length > 0 &&
-          typeof ac.ACModelId === 'string' && ac.ACModelId.length > 0 &&
-          typeof ac.MeritFeature === 'string' && ac.MeritFeature.length > 0 &&
-          typeof ac.ACStateData === 'string' && ac.ACStateData.length > 0
-        );
+        const acId = typeof ac.Id === 'string' ? ac.Id.trim() : '';
+        const uniqueId = typeof ac.DeviceUniqueId === 'string' ? ac.DeviceUniqueId.trim() : '';
+        const stateHex = typeof ac.ACStateData === 'string' ? ac.ACStateData.trim() : '';
 
-        if (!hasRequiredFields) {
-          this.log.warn(`[HTTP API] Skipping AC entry with missing required fields in group ${groupId} at index ${acIndex}`);
+        if (!acId || !uniqueId) {
+          this.log.warn(
+            `[HTTP API] Skipping AC entry missing device identifiers in group ${groupId} at index ${acIndex}`,
+          );
           continue;
         }
 
+        const acName = typeof ac.Name === 'string' && ac.Name.trim().length > 0
+          ? ac.Name.trim()
+          : `Toshiba AC ${acIndex + 1}`;
+        const acModelId = typeof ac.ACModelId === 'string' ? ac.ACModelId.trim() : '';
+        const meritFeature = typeof ac.MeritFeature === 'string' ? ac.MeritFeature.trim() : '';
+
+        if (!stateHex) {
+          this.log.warn(
+            `[HTTP API] AC entry ${acName} (${uniqueId}) has missing ACStateData; using unknown state fallback`,
+          );
+        }
+
         devices.push({
-          acId: ac.Id,
-          uniqueId: ac.DeviceUniqueId,
-          name: ac.Name,
+          acId,
+          uniqueId,
+          name: acName,
           groupId,
           groupName,
-          acModelId: ac.ACModelId,
-          meritFeature: ac.MeritFeature,
+          acModelId,
+          meritFeature,
           opeMode: ac.OpeMode,
           systemConfig: ac.SystemConfig,
-          stateHex: ac.ACStateData,
+          stateHex,
           adapterType: ac.AdapterType,
           firmwareVersion: ac.FirmwareVersion,
         });
@@ -197,14 +209,25 @@ export class ToshibaHttpApi {
 
   async getDeviceAdditionalInfo(acId: string, uniqueId?: string): Promise<ToshibaAdditionalInfo> {
     let state: ToshibaDeviceStateResponse;
-    if (uniqueId) {
+    if (uniqueId && !this.additionalInfoByUniqueIdUnavailable) {
       try {
         state = await this.fetchDeviceStateByUniqueId(uniqueId);
       } catch (error) {
         if (error instanceof ToshibaAuthError) {
           throw error;
         }
-        this.log.debug(`[HTTP API] Failed to fetch additional info by unique id (${uniqueId}), falling back to ACId (${acId})`);
+
+        if (this.shouldDisableAdditionalInfoUniqueIdEndpoint(error)) {
+          this.additionalInfoByUniqueIdUnavailable = true;
+          this.log.info(
+            '[HTTP API] Additional-info unique-device-id endpoint unavailable; using ACId fallback for this session',
+          );
+        } else {
+          this.log.debug(
+            `[HTTP API] Additional info by unique id unavailable for ${uniqueId}, falling back to ACId (${acId})`,
+          );
+        }
+
         state = await this.fetchDeviceStateByAcId(acId);
       }
     } else {
@@ -470,6 +493,18 @@ export class ToshibaHttpApi {
     }
 
     return undefined;
+  }
+
+  private shouldDisableAdditionalInfoUniqueIdEndpoint(error: unknown): boolean {
+    if (!(error instanceof ToshibaApiError)) {
+      return false;
+    }
+
+    return (
+      error.httpStatus === 400 ||
+      error.httpStatus === 403 ||
+      error.httpStatus === 404
+    );
   }
 
   private isAuthFailure(statusCode?: string, message?: string): boolean {
